@@ -1,4 +1,4 @@
-Output docs/assets/demo.gif
+Output docs/assets/workflow-demo.gif
 
 Set Shell "zsh"
 Set FontSize 16
