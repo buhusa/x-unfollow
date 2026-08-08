@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from typer.testing import CliRunner
 
 import x_unfollow.cli as cli
-from x_unfollow.models import DecisionRecord, XUser
+from x_unfollow.models import DecisionRecord, ScanBatch, XUser
 from x_unfollow.oauth import DEFAULT_SCOPES, OAuthToken
 from x_unfollow.storage import Storage
 from x_unfollow.x_api import XApiError
@@ -213,11 +213,19 @@ def test_scan_with_fake_api_saves_decisions_and_exports_candidates(tmp_path, mon
         def get_me(self):
             return XUser(id="me", username="me", name="Me")
 
-    def fake_scan_accounts(api, source_user_id, config, limit=None, progress=None):
+    def fake_scan_account_batch(
+        api,
+        source_user_id,
+        config,
+        limit=None,
+        pagination_token=None,
+        progress=None,
+    ):
         assert isinstance(api, FakeClient)
         assert api.token == "test-token"
         assert source_user_id == "me"
         assert limit is None
+        assert pagination_token is None
         assert progress is not None
         progress("following_loaded", 2, 2, None)
         progress("latest_activity", 0, 2, None)
@@ -227,16 +235,19 @@ def test_scan_with_fake_api_saves_decisions_and_exports_candidates(tmp_path, mon
             2,
             XUser(id="quiet", username="quiet", name="Quiet"),
         )
-        return [record("quiet"), replace(record("active"), decision="keep")]
+        return ScanBatch(
+            records=[record("quiet"), replace(record("active"), decision="keep")],
+            next_token=None,
+        )
 
     monkeypatch.setattr(cli, "XApiClient", FakeClient)
-    monkeypatch.setattr(cli, "scan_accounts", fake_scan_accounts)
+    monkeypatch.setattr(cli, "scan_account_batch", fake_scan_account_batch)
 
     result = runner.invoke(cli.app, ["scan", "--app-dir", str(app_dir), "--yes"])
 
     assert result.exit_code == 0
-    assert "Scanned 2 account(s)" in result.output
-    assert "Candidates: 1" in result.output
+    assert "Scanned this batch: 2 account(s)" in result.output
+    assert "Candidates in current pass: 1" in result.output
     assert "Loaded 2 followed account(s)" in result.output
     assert "[1/2] Scanning @quiet" in result.output
     assert str(app_dir / "exports" / "candidates.csv") in result.output
@@ -245,6 +256,192 @@ def test_scan_with_fake_api_saves_decisions_and_exports_candidates(tmp_path, mon
     records = Storage(app_dir).load_decisions()
     assert [item.user.username for item in records] == ["quiet", "active"]
     assert (app_dir / "exports" / "candidates.csv").exists()
+    assert (app_dir / "exports" / "scan_results.csv").exists()
+    assert (app_dir / "exports" / "scan_history.csv").exists()
+
+
+def test_two_scans_resume_next_batch_and_preserve_first_batch_review(
+    tmp_path, monkeypatch
+):
+    app_dir = tmp_path / "state"
+    cli.TokenStore(app_dir).save_bearer_token("test-token")
+    calls = []
+
+    class FakeClient:
+        def __init__(self, _token):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def get_me(self):
+            return XUser(id="me", username="me", name="Me")
+
+    def fake_scan_account_batch(
+        api,
+        source_user_id,
+        config,
+        limit=None,
+        pagination_token=None,
+        progress=None,
+    ):
+        calls.append(pagination_token)
+        if pagination_token is None:
+            return ScanBatch(records=[record("first")], next_token="page-2")
+        assert pagination_token == "page-2"
+        return ScanBatch(records=[record("second")], next_token=None)
+
+    monkeypatch.setattr(cli, "XApiClient", FakeClient)
+    monkeypatch.setattr(cli, "scan_account_batch", fake_scan_account_batch)
+
+    first_result = runner.invoke(
+        cli.app, ["scan", "--app-dir", str(app_dir), "--yes"]
+    )
+    first_records = Storage(app_dir).load_decisions()
+    Storage(app_dir).save_decisions(
+        [replace(first_records[0], review="unfollow")]
+    )
+    second_result = runner.invoke(
+        cli.app, ["scan", "--app-dir", str(app_dir), "--yes"]
+    )
+
+    assert first_result.exit_code == 0
+    assert second_result.exit_code == 0
+    assert calls == [None, "page-2"]
+    records = Storage(app_dir).load_decisions()
+    assert [item.user.username for item in records] == ["first", "second"]
+    assert records[0].review == "unfollow"
+    cursor = Storage(app_dir).load_scan_cursor()
+    assert cursor is not None
+    assert cursor.complete is True
+    assert cursor.scanned_count == 2
+    assert "Following-list pass complete" in second_result.output
+    history = (app_dir / "exports" / "scan_history.csv").read_text(encoding="utf-8")
+    assert "first" in history
+    assert "second" in history
+
+
+def test_completed_scan_does_not_repeat_without_explicit_restart(tmp_path, monkeypatch):
+    app_dir = tmp_path / "state"
+    cli.TokenStore(app_dir).save_bearer_token("test-token")
+    calls = []
+
+    class FakeClient:
+        def __init__(self, _token):
+            calls.append("client-created")
+
+    monkeypatch.setattr(cli, "XApiClient", FakeClient)
+    now = datetime(2026, 8, 8, tzinfo=timezone.utc)
+    Storage(app_dir).save_scan_cursor(
+        cli.ScanCursor(
+            source_user_id="me",
+            source_username="me",
+            cycle_id="done",
+            started_at=now,
+            updated_at=now,
+            scanned_count=250,
+            batch_number=3,
+            next_token=None,
+            complete=True,
+        )
+    )
+
+    result = runner.invoke(cli.app, ["scan", "--app-dir", str(app_dir), "--yes"])
+
+    assert result.exit_code == 0
+    assert "already complete" in result.output
+    assert "--restart" in result.output
+    assert calls == []
+
+
+def test_legacy_results_without_cursor_are_kept_until_restart(tmp_path):
+    app_dir = tmp_path / "state"
+    Storage(app_dir).save_decisions([replace(record("old"), review="unfollow")])
+
+    result = runner.invoke(cli.app, ["scan", "--app-dir", str(app_dir), "--yes"])
+
+    assert result.exit_code == 2
+    assert "no reusable X cursor" in result.output
+    assert Storage(app_dir).load_decisions()[0].review == "unfollow"
+
+
+def test_account_switch_blocks_old_completed_pass_before_api_cost(tmp_path):
+    app_dir = tmp_path / "state"
+    storage = Storage(app_dir)
+    now = datetime(2026, 8, 8, tzinfo=timezone.utc)
+    storage.save_connection_context("new", "new_account")
+    storage.save_scan_cursor(
+        cli.ScanCursor(
+            source_user_id="old",
+            source_username="old_account",
+            cycle_id="old-cycle",
+            started_at=now,
+            updated_at=now,
+            scanned_count=100,
+            batch_number=1,
+            next_token=None,
+            complete=True,
+        )
+    )
+
+    result = runner.invoke(cli.app, ["scan", "--app-dir", str(app_dir), "--yes"])
+
+    assert result.exit_code == 2
+    assert "connected X account differs" in result.output
+    assert "--restart" in result.output
+
+
+def test_live_account_mismatch_blocks_when_cached_connection_is_stale(
+    tmp_path, monkeypatch
+):
+    app_dir = tmp_path / "state"
+    storage = Storage(app_dir)
+    cli.TokenStore(app_dir).save_bearer_token("test-token")
+    now = datetime(2026, 8, 8, tzinfo=timezone.utc)
+    storage.save_connection_context("old", "old_account")
+    storage.save_scan_cursor(
+        cli.ScanCursor(
+            source_user_id="old",
+            source_username="old_account",
+            cycle_id="old-cycle",
+            started_at=now,
+            updated_at=now,
+            scanned_count=100,
+            batch_number=1,
+            next_token="page-2",
+        )
+    )
+    scan_calls = []
+
+    class FakeClient:
+        def __init__(self, _token):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def get_me(self):
+            return XUser(id="new", username="new_account", name="New")
+
+    monkeypatch.setattr(cli, "XApiClient", FakeClient)
+    monkeypatch.setattr(
+        cli,
+        "scan_account_batch",
+        lambda *args, **kwargs: scan_calls.append((args, kwargs)),
+    )
+
+    result = runner.invoke(cli.app, ["scan", "--app-dir", str(app_dir), "--yes"])
+
+    assert result.exit_code == 2
+    assert "live X account differs" in result.output
+    assert scan_calls == []
+    assert storage.load_scan_cursor().cycle_id == "old-cycle"
 
 
 def test_review_marks_first_candidate_unfollow_and_second_keep_using_input(tmp_path):
@@ -481,6 +678,11 @@ def test_real_unfollow_marks_success_and_writes_audit(tmp_path, monkeypatch):
     assert result.exit_code == 0
     assert "Success: 1" in result.output
     assert Storage(app_dir).load_decisions()[0].review == "unfollowed"
+    candidates = (app_dir / "exports" / "candidates.csv").read_text(
+        encoding="utf-8"
+    )
+    assert "unfollowed" in candidates
+    assert ",unfollow," not in candidates
     audit = Storage(app_dir).unfollow_audit_path.read_text(encoding="utf-8")
     assert '"username": "quiet"' in audit
     assert '"success": true' in audit
@@ -542,11 +744,18 @@ def test_x_api_error_in_scan_exits_friendly(tmp_path, monkeypatch):
         def get_me(self):
             return XUser(id="me", username="me", name="Me")
 
-    def fake_scan_accounts(api, source_user_id, config, limit=None, progress=None):
+    def fake_scan_account_batch(
+        api,
+        source_user_id,
+        config,
+        limit=None,
+        pagination_token=None,
+        progress=None,
+    ):
         raise XApiError("X API returned 403: access denied", status_code=403)
 
     monkeypatch.setattr(cli, "XApiClient", FakeClient)
-    monkeypatch.setattr(cli, "scan_accounts", fake_scan_accounts)
+    monkeypatch.setattr(cli, "scan_account_batch", fake_scan_account_batch)
 
     result = runner.invoke(cli.app, ["scan", "--app-dir", str(app_dir), "--yes"])
 

@@ -20,6 +20,8 @@ def classify_posts(posts: list[XPost], rules: RuleConfig | None = None) -> Activ
     rules = rules or RuleConfig()
     last_own_post_at = None
     last_reply_at = None
+    last_own_post_id = None
+    last_reply_id = None
 
     for post in sorted(posts, key=lambda item: item.created_at, reverse=True):
         is_retweet = _has_reference(post, "retweeted")
@@ -28,6 +30,7 @@ def classify_posts(posts: list[XPost], rules: RuleConfig | None = None) -> Activ
 
         if is_reply and last_reply_at is None:
             last_reply_at = post.created_at
+            last_reply_id = post.id
 
         counts_as_own = not is_reply and not is_quote
         if is_retweet and not rules.count_retweets_as_activity:
@@ -37,6 +40,7 @@ def classify_posts(posts: list[XPost], rules: RuleConfig | None = None) -> Activ
 
         if counts_as_own and last_own_post_at is None:
             last_own_post_at = post.created_at
+            last_own_post_id = post.id
 
         if last_own_post_at and last_reply_at:
             break
@@ -44,6 +48,8 @@ def classify_posts(posts: list[XPost], rules: RuleConfig | None = None) -> Activ
     return ActivitySummary(
         last_own_post_at=last_own_post_at,
         last_reply_at=last_reply_at,
+        last_own_post_id=last_own_post_id,
+        last_reply_id=last_reply_id,
     )
 
 
@@ -59,6 +65,8 @@ def evaluate_account(
     last_reply_at: datetime | None,
     now: datetime,
     rules: RuleConfig,
+    last_own_post_id: str | None = None,
+    last_reply_id: str | None = None,
 ) -> DecisionRecord:
     days_since_own_post = _days_since(last_own_post_at, now)
     days_since_reply = _days_since(last_reply_at, now)
@@ -94,4 +102,6 @@ def evaluate_account(
         rule_match_reply=reply_match,
         decision="candidate" if is_candidate else "keep",
         reason=reason,
+        last_own_post_id=last_own_post_id,
+        last_reply_id=last_reply_id,
     )

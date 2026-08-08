@@ -327,3 +327,19 @@ def test_tui_number_key_opens_item_directly(monkeypatch):
 
     assert selected_index == cli._menu_index_for_key("8")
     assert choice == "8"
+
+
+def test_merge_scan_records_replaces_duplicate_and_resets_destructive_review():
+    older = replace(record("quiet"), review="unfollow")
+    newer = replace(
+        record("quiet"),
+        decision="keep",
+        rule_match_own_post=False,
+        rule_match_reply=False,
+    )
+
+    merged = cli._merge_scan_records([older], [newer])
+
+    assert len(merged) == 1
+    assert merged[0].decision == "keep"
+    assert merged[0].review == "pending"

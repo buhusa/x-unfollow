@@ -78,6 +78,8 @@ class XPost:
 class ActivitySummary:
     last_own_post_at: datetime | None
     last_reply_at: datetime | None
+    last_own_post_id: str | None = None
+    last_reply_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -93,3 +95,30 @@ class DecisionRecord:
     reason: str
     review: str = "pending"
     account_status: str = "ok"
+    last_own_post_id: str | None = None
+    last_reply_id: str | None = None
+    scanned_at: datetime | None = None
+    scan_run_id: str | None = None
+    scan_cycle_id: str | None = None
+    scan_batch_number: int | None = None
+    scan_position: int | None = None
+
+
+@dataclass(frozen=True)
+class ScanBatch:
+    records: list[DecisionRecord]
+    next_token: str | None
+
+
+@dataclass(frozen=True)
+class ScanCursor:
+    source_user_id: str
+    source_username: str
+    cycle_id: str
+    started_at: datetime
+    updated_at: datetime
+    scanned_count: int
+    batch_number: int
+    next_token: str | None
+    complete: bool = False
+    config_signature: str = ""

@@ -85,6 +85,7 @@ created with owner-only permissions on supported systems.
 
 1. Open option `5` and review the inactivity rules and budget.
 2. Use option `1` to run a small scan.
+   Repeating option `1` continues with the next batch until the full list is done.
 3. Use option `2` to review candidates.
 4. Press `u` only for accounts you want to mark.
 5. Use option `3` for the dry-run preview.
@@ -104,6 +105,45 @@ count in option `5`.
 Actual charges can be lower due to fewer returned resources and X API
 deduplication. Pricing can change, so check the Developer Console.
 
+## Continue or restart a scan
+
+X-Unfollow stores X's pagination cursor after a batch completes successfully.
+For a limit of 100, repeated scans therefore process 1-100, then 101-200, and
+so on. The menu shows the number scanned in the current pass.
+
+The cursor is advanced only after the batch results and exports have been
+saved. If a scan fails before that point, it is safe to retry, although X may
+charge again for repeated API reads.
+
+After the full list is complete, use `scan --restart` or confirm a new pass in
+the menu to begin again. A changed X account or changed scan rules starts or
+requires a separate pass so data is not mixed.
+
+The X following list is live rather than a frozen snapshot. Avoid follow and
+unfollow changes until a multi-batch pass is complete.
+
+X notes that saved pagination tokens may expire. If that happens, existing
+results remain intact and `scan --restart` begins a fresh pass.
+
+Older `0.1.x` scan files have no reusable X pagination cursor. The first scan
+after upgrading starts a new pass from the beginning. Every later batch can be
+resumed normally.
+
+## Check the tool's work
+
+After each successful batch, option `8` lists:
+
+```text
+scan_results.csv  all accounts in the current pass
+scan_history.csv  append-only results from every completed batch
+candidates.csv    only current inactivity candidates
+```
+
+`scan_results.csv` is the easiest file for manual verification. It includes
+the exact rules used, scan time, account status, decision, latest own-post and
+reply timestamps, plus direct post URLs when available. The export deliberately
+does not contain OAuth credentials or post text.
+
 ## Files
 
 ```text
@@ -111,11 +151,15 @@ user-data/
 ├── config.toml
 ├── tokens.json
 ├── data/
+│   ├── connection_context.json
 │   ├── decisions.json
+│   ├── scan_cursor.json
 │   ├── scan_context.json
 │   └── unfollow_audit.jsonl
 └── exports/
-    └── candidates.csv
+    ├── candidates.csv
+    ├── scan_history.csv
+    └── scan_results.csv
 ```
 
 `user-data/` is ignored by Git. Do not override that ignore rule or publish
@@ -168,6 +212,7 @@ in option `5` if that extra detail is worth the additional API cost.
 .venv/bin/x-unfollow status
 .venv/bin/x-unfollow check
 .venv/bin/x-unfollow scan --limit 3
+.venv/bin/x-unfollow scan --restart
 .venv/bin/x-unfollow review
 .venv/bin/x-unfollow unfollow --dry-run
 ```

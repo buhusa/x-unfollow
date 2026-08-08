@@ -9,6 +9,7 @@ from x_unfollow.models import (
     AppConfig,
     CombinationMode,
     DecisionRecord,
+    ScanBatch,
     XPost,
     XUser,
 )
@@ -22,6 +23,15 @@ class ScanApi(Protocol):
         page_size: int,
         limit: int | None = None,
     ) -> list[XUser]:
+        ...
+
+    def get_following_batch(
+        self,
+        user_id: str,
+        page_size: int,
+        limit: int | None = None,
+        pagination_token: str | None = None,
+    ) -> tuple[list[XUser], str | None]:
         ...
 
     def get_user_posts(
@@ -55,6 +65,37 @@ def scan_accounts(
         page_size=config.api.page_size_following,
         limit=effective_limit,
     )
+    return _scan_following(api, following, config, now, progress)
+
+
+def scan_account_batch(
+    api: ScanApi,
+    source_user_id: str,
+    config: AppConfig,
+    now: datetime | None = None,
+    limit: int | None = None,
+    pagination_token: str | None = None,
+    progress: ScanProgress | None = None,
+) -> ScanBatch:
+    now = now or datetime.now(timezone.utc)
+    effective_limit = limit or config.api.max_accounts_per_scan
+    following, next_token = api.get_following_batch(
+        source_user_id,
+        page_size=config.api.page_size_following,
+        limit=effective_limit,
+        pagination_token=pagination_token,
+    )
+    records = _scan_following(api, following, config, now, progress)
+    return ScanBatch(records=records, next_token=next_token)
+
+
+def _scan_following(
+    api: ScanApi,
+    following: list[XUser],
+    config: AppConfig,
+    now: datetime,
+    progress: ScanProgress | None,
+) -> list[DecisionRecord]:
     if progress is not None:
         progress("following_loaded", len(following), len(following), None)
         progress("latest_activity", 0, len(following), None)
@@ -124,6 +165,8 @@ def _scan_account(
             last_reply_at=activity.last_reply_at,
             now=now,
             rules=config.rules,
+            last_own_post_id=activity.last_own_post_id,
+            last_reply_id=activity.last_reply_id,
         )
 
     posts: list[XPost] = []
@@ -162,6 +205,8 @@ def _scan_account(
                 last_reply_at=activity.last_reply_at,
                 now=now,
                 rules=config.rules,
+                last_own_post_id=activity.last_own_post_id,
+                last_reply_id=activity.last_reply_id,
             )
         if not next_token:
             break
@@ -198,6 +243,8 @@ def _scan_account(
         last_reply_at=activity.last_reply_at,
         now=now,
         rules=config.rules,
+        last_own_post_id=activity.last_own_post_id,
+        last_reply_id=activity.last_reply_id,
     )
 
 

@@ -10,11 +10,13 @@ with the official X API.
 X-Unfollow:
 
 - loads accounts you follow;
+- continues with the next batch on every run instead of starting over;
 - checks their latest own posts and replies;
 - applies inactivity rules you control;
 - lets you review every candidate;
-- previews changes before anything happens; and
-- unfollows only accounts you explicitly marked and confirmed.
+- previews changes before anything happens;
+- unfollows only accounts you explicitly marked and confirmed; and
+- exports a complete, manually auditable record of every checked account.
 
 It uses deterministic Python code. There is no scraping, browser automation, or
 LLM deciding who to unfollow.
@@ -108,6 +110,49 @@ q  leave review
 
 Pressing `u` only creates a local mark. The real unfollow happens later in step
 4 and always requires a separate confirmation.
+
+### Scan batches
+
+If your limit is 100 accounts, the first run scans accounts 1-100 and stores
+X's pagination cursor locally. The next run continues with the next batch. It
+does not intentionally rescan the first 100.
+
+When the complete following list has been reached, X-Unfollow stops. Start a
+fresh pass from account 1 only when you confirm it in the menu or run:
+
+```bash
+.venv/bin/x-unfollow scan --restart
+```
+
+Changing activity rules during an unfinished pass blocks resume so results
+from different rules are not mixed. Start a new pass to use the changed rules.
+
+Avoid following or unfollowing accounts while a multi-batch pass is running.
+X controls the ordering of its live following list, so changes during a pass
+can shift accounts between pages.
+
+X pagination tokens are opaque and can expire. If X rejects a saved token,
+your existing results stay untouched and the CLI tells you to start a fresh
+pass. See the official [X pagination guide](https://docs.x.com/x-api/fundamentals/pagination).
+
+## Verify scan results
+
+Menu option `8` shows three CSV files:
+
+- `scan_results.csv`: every account in the current pass;
+- `scan_history.csv`: every completed batch from all passes; and
+- `candidates.csv`: only accounts matching your inactivity rules.
+
+The full result includes the scan time, batch and position, decision, evidence
+status, rule matches, last own-post and reply dates, and direct X URLs for the
+posts when X returned their IDs. No OAuth tokens or post text are exported.
+
+Open `scan_results.csv` in a spreadsheet when you want to manually compare the
+tool's decision with the linked X profiles and posts.
+
+Results created with X-Unfollow `0.1.x` do not contain a saved X cursor. The
+first scan after upgrading to `0.2.x` starts a new pass; later runs continue
+normally from the stored cursor.
 
 ## Settings and costs
 

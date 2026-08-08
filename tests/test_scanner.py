@@ -10,7 +10,7 @@ from x_unfollow.models import (
     XPost,
     XUser,
 )
-from x_unfollow.scanner import scan_accounts
+from x_unfollow.scanner import scan_account_batch, scan_accounts
 from x_unfollow.x_api import RateLimitError, XApiError
 
 
@@ -29,6 +29,19 @@ class FakeScanApi:
     def get_following(self, user_id: str, page_size: int, limit: int | None = None):
         self.following_calls.append((user_id, page_size, limit))
         return self.following[:limit]
+
+    def get_following_batch(
+        self,
+        user_id: str,
+        page_size: int,
+        limit: int | None = None,
+        pagination_token: str | None = None,
+    ):
+        self.following_calls.append((user_id, page_size, limit, pagination_token))
+        start = int(pagination_token or 0)
+        end = start + (limit or len(self.following))
+        next_token = str(end) if end < len(self.following) else None
+        return self.following[start:end], next_token
 
     def get_user_posts(
         self,
@@ -97,8 +110,34 @@ def test_scan_accounts_generates_candidate_records_from_followings():
     assert len(records) == 1
     assert records[0].user == user
     assert records[0].decision == "candidate"
+    assert records[0].last_own_post_id == "own"
+    assert records[0].last_reply_id == "reply"
     assert records[0].last_own_post_at == datetime(2025, 1, 1, tzinfo=timezone.utc)
     assert records[0].last_reply_at == datetime(2025, 1, 2, tzinfo=timezone.utc)
+
+
+def test_scan_account_batch_uses_and_returns_following_cursor():
+    users = [XUser(id=str(i), username=f"u{i}", name=f"U {i}") for i in range(3)]
+    api = FakeScanApi(
+        following=users,
+        post_pages={
+            ("1", None): ([], None),
+            ("2", None): ([], None),
+        },
+    )
+
+    batch = scan_account_batch(
+        api,
+        source_user_id="source",
+        config=AppConfig(),
+        now=NOW,
+        limit=2,
+        pagination_token="1",
+    )
+
+    assert [record.user.username for record in batch.records] == ["u1", "u2"]
+    assert batch.next_token is None
+    assert api.following_calls == [("source", 1000, 2, "1")]
 
 
 def test_scan_accounts_stops_fetching_after_both_activity_timestamps_are_known():

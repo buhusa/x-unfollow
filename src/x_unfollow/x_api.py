@@ -74,13 +74,27 @@ class XApiClient:
         page_size: int,
         limit: int | None = None,
     ) -> list[XUser]:
+        users, _next_token = self.get_following_batch(
+            user_id,
+            page_size,
+            limit,
+        )
+        return users
+
+    def get_following_batch(
+        self,
+        user_id: str,
+        page_size: int,
+        limit: int | None = None,
+        pagination_token: str | None = None,
+    ) -> tuple[list[XUser], str | None]:
         users: list[XUser] = []
-        next_token: str | None = None
+        next_token = pagination_token
 
         while True:
             remaining = None if limit is None else limit - len(users)
             if remaining is not None and remaining <= 0:
-                return users
+                return users, next_token
             params = {
                 "max_results": page_size if remaining is None else min(page_size, remaining),
                 "user.fields": USER_FIELDS,
@@ -91,11 +105,11 @@ class XApiClient:
             response = self._request("GET", f"/users/{user_id}/following", params=params)
             payload = response.json()
             users.extend(_parse_user(item) for item in payload.get("data", []))
-            if limit is not None and len(users) >= limit:
-                return users[:limit]
             next_token = payload.get("meta", {}).get("next_token")
+            if limit is not None and len(users) >= limit:
+                return users[:limit], next_token
             if not next_token:
-                return users
+                return users, None
 
     def get_user_posts(
         self,

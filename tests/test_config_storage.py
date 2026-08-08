@@ -15,6 +15,7 @@ from x_unfollow.models import (
     CombinationMode,
     DecisionRecord,
     RuleConfig,
+    ScanCursor,
     XUser,
 )
 from x_unfollow.storage import Storage
@@ -236,6 +237,39 @@ def test_storage_round_trips_scan_account_context(tmp_path):
         "source_username": "buhusa",
     }
 
+    storage.save_connection_context("456", "connected")
+    assert storage.load_connection_context() == {
+        "source_user_id": "456",
+        "source_username": "connected",
+    }
+
+
+def test_storage_round_trips_scan_cursor_and_clears_current_cycle(tmp_path):
+    storage = Storage(tmp_path)
+    now = datetime(2026, 8, 8, 12, 0, tzinfo=timezone.utc)
+    cursor = ScanCursor(
+        source_user_id="123",
+        source_username="owner",
+        cycle_id="cycle-1",
+        started_at=now,
+        updated_at=now,
+        scanned_count=100,
+        batch_number=1,
+        next_token="page-2",
+        config_signature="rules-v1",
+    )
+
+    storage.save_scan_cursor(cursor)
+    storage.save_decisions([])
+
+    assert storage.load_scan_cursor() == cursor
+    assert stat.S_IMODE(storage.scan_cursor_path.stat().st_mode) == 0o600
+
+    storage.clear_scan_cycle()
+
+    assert storage.load_scan_cursor() is None
+    assert storage.load_decisions() == []
+
 
 def test_storage_loads_legacy_decisions_with_ok_account_status(tmp_path):
     storage = Storage(tmp_path)
@@ -322,3 +356,43 @@ def test_storage_exports_only_candidate_records(tmp_path):
     content = export_path.read_text(encoding="utf-8")
     assert "quiet" in content
     assert "active" not in content
+
+
+def test_storage_exports_all_scan_results_with_evidence_urls_and_rule_snapshot(
+    tmp_path,
+):
+    storage = Storage(tmp_path)
+    record = DecisionRecord(
+        user=XUser(id="1", username="quiet", name="\t=Formula"),
+        last_own_post_at=datetime(2025, 1, 1, tzinfo=timezone.utc),
+        days_since_own_post=584,
+        last_reply_at=datetime(2025, 1, 2, tzinfo=timezone.utc),
+        days_since_reply=583,
+        rule_match_own_post=True,
+        rule_match_reply=True,
+        decision="candidate",
+        reason="inactive",
+        last_own_post_id="post-1",
+        last_reply_id="reply-1",
+        scanned_at=datetime(2026, 8, 8, tzinfo=timezone.utc),
+        scan_run_id="run-1",
+        scan_cycle_id="cycle-1",
+        scan_batch_number=1,
+        scan_position=1,
+    )
+
+    results_path = storage.export_scan_results([record], AppConfig())
+    history_path = storage.append_scan_history([record], AppConfig())
+    storage.append_scan_history([record], AppConfig())
+
+    results = results_path.read_text(encoding="utf-8")
+    history = history_path.read_text(encoding="utf-8")
+    assert "https://x.com/quiet/status/post-1" in results
+    assert "https://x.com/quiet/status/reply-1" in results
+    assert "own_post_threshold_days" in results
+    assert "180" in results
+    assert "'\t=Formula" in results
+    assert "run-1" in history
+    assert len(history_path.read_text(encoding="utf-8").splitlines()) == 2
+    assert stat.S_IMODE(results_path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(history_path.stat().st_mode) == 0o600

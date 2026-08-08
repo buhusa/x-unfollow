@@ -128,6 +128,43 @@ def test_get_following_limits_api_page_size_to_avoid_extra_billable_users():
     assert len(users) == 3
 
 
+def test_get_following_batch_returns_cursor_and_resumes_from_it():
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        assert request.url.params["max_results"] == "2"
+        if len(requests) == 1:
+            assert "pagination_token" not in request.url.params
+            return json_response(
+                payload={
+                    "data": [
+                        {"id": "1", "username": "one", "name": "One"},
+                        {"id": "2", "username": "two", "name": "Two"},
+                    ],
+                    "meta": {"next_token": "page-2"},
+                }
+            )
+        assert request.url.params["pagination_token"] == "page-2"
+        return json_response(
+            payload={
+                "data": [{"id": "3", "username": "three", "name": "Three"}],
+                "meta": {},
+            }
+        )
+
+    client = make_client(handler)
+    first, cursor = client.get_following_batch("123", page_size=1000, limit=2)
+    second, final_cursor = client.get_following_batch(
+        "123", page_size=1000, limit=2, pagination_token=cursor
+    )
+
+    assert [user.username for user in first] == ["one", "two"]
+    assert cursor == "page-2"
+    assert [user.username for user in second] == ["three"]
+    assert final_cursor is None
+
+
 def test_get_posts_by_ids_batches_fields_and_parses_activity():
     def handler(request):
         assert request.method == "GET"

@@ -5,6 +5,7 @@ from contextlib import nullcontext
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
+from uuid import uuid4
 
 import typer
 import readchar
@@ -25,6 +26,7 @@ from x_unfollow.models import (
     CombinationMode,
     DecisionRecord,
     RuleConfig,
+    ScanCursor,
     SafetyConfig,
 )
 from x_unfollow.oauth import (
@@ -35,7 +37,7 @@ from x_unfollow.oauth import (
     XOAuth2PKCE,
 )
 from x_unfollow.review import apply_review_choice
-from x_unfollow.scanner import scan_accounts
+from x_unfollow.scanner import scan_account_batch
 from x_unfollow.storage import Storage
 from x_unfollow.tokens import MissingTokenError, OAuthCredentials, TokenStore
 from x_unfollow.unfollow import execute_unfollows
@@ -127,6 +129,40 @@ def _format_activity(value: datetime | None, days: int | None) -> str:
     else:
         age = f"{days} days ago"
     return f"{timestamp} ({age})"
+
+
+def _scan_config_signature(config: AppConfig) -> str:
+    rules = config.rules
+    api = config.api
+    return "|".join(
+        [
+            str(rules.own_post_threshold_days),
+            str(rules.reply_threshold_days),
+            rules.combination.value,
+            str(rules.count_retweets_as_activity),
+            str(rules.count_quote_posts_as_own_posts),
+            str(api.page_size_tweets),
+            str(api.max_tweet_pages_per_user),
+        ]
+    )
+
+
+def _merge_scan_records(
+    existing: list[DecisionRecord],
+    new_records: list[DecisionRecord],
+) -> list[DecisionRecord]:
+    merged = list(existing)
+    indexes = {record.user.id: index for index, record in enumerate(existing)}
+    for record in new_records:
+        existing_index = indexes.get(record.user.id)
+        if existing_index is None:
+            merged.append(record)
+            indexes[record.user.id] = len(merged) - 1
+        else:
+            # A live following list can shift between pages. New evidence must
+            # invalidate any older destructive review decision for that account.
+            merged[existing_index] = replace(record, review="pending")
+    return merged
 
 
 def _print_unfollow_targets(records: list[DecisionRecord]) -> None:
@@ -272,10 +308,15 @@ MENU_ITEMS = (
 
 def _menu_status(app_dir: Path) -> tuple[str, str, str, str]:
     connected = _has_verified_oauth_login(app_dir)
-    context = Storage(app_dir).load_scan_context()
-    records = Storage(app_dir).load_decisions()
+    storage = Storage(app_dir)
+    context = storage.load_scan_context()
+    connection_context = storage.load_connection_context()
+    cursor = storage.load_scan_cursor()
+    records = storage.load_decisions()
 
-    if connected and context is not None:
+    if connected and connection_context is not None:
+        account_line = f"OAuth: connected as @{connection_context['source_username']}"
+    elif connected and context is not None:
         account_line = (
             f"OAuth: connected | Last scan account: @{context['source_username']}"
         )
@@ -301,9 +342,14 @@ def _menu_status(app_dir: Path) -> tuple[str, str, str, str]:
     ]
     pending_count = sum(1 for record in candidates if record.review == "pending")
     marked_count = sum(1 for record in candidates if record.review == "unfollow")
+    if cursor is None:
+        progress_text = f"{len(records)} accounts"
+    elif cursor.complete:
+        progress_text = f"Pass complete: {cursor.scanned_count} accounts"
+    else:
+        progress_text = f"Pass progress: {cursor.scanned_count} accounts"
     scan_line = (
-        f"Last scan: {len(records)} accounts | "
-        f"{pending_count} to review | {marked_count} marked"
+        f"{progress_text} | {pending_count} to review | {marked_count} marked"
     )
     if pending_count:
         next_line = "Next: [2] Review candidates and mark actions"
@@ -311,8 +357,11 @@ def _menu_status(app_dir: Path) -> tuple[str, str, str, str]:
     elif marked_count:
         next_line = "Next: [3] Preview, then [4] execute marked unfollows"
         recommended_key = "3"
+    elif cursor is not None and not cursor.complete:
+        next_line = "Next: [1] Continue with the next batch"
+        recommended_key = "1"
     else:
-        next_line = "Next: [1] Start a new scan when needed"
+        next_line = "Next: [1] Start a new full pass when needed"
         recommended_key = "1"
     return account_line, scan_line, next_line, recommended_key
 
@@ -431,8 +480,8 @@ def _run_pending_connection_check(app_dir: Path) -> None:
 
 def _run_menu_action(choice: str) -> None:
     actions = {
-        "1": lambda: scan(None, None, False),
-        "scan": lambda: scan(None, None, False),
+        "1": lambda: scan(None, None, False, False),
+        "scan": lambda: scan(None, None, False, False),
         "2": lambda: review(None),
         "r": lambda: review(None),
         "3": lambda: unfollow(None, True, False),
@@ -748,6 +797,7 @@ def status(
     path = _config_path(resolved_app_dir)
     config = _load_config_or_exit(path)
     records = Storage(resolved_app_dir).load_decisions()
+    cursor = Storage(resolved_app_dir).load_scan_cursor()
     candidate_count = sum(1 for record in records if record.decision == "candidate")
     marked_count = len(_eligible_unfollow_records(records))
     token_store = TokenStore(resolved_app_dir)
@@ -791,6 +841,18 @@ def status(
     )
     console.print(f"Candidate count: {candidate_count}", soft_wrap=True)
     console.print(f"Marked unfollow count: {marked_count}", soft_wrap=True)
+    if cursor is None:
+        console.print("Following-list pass: not started", soft_wrap=True)
+    elif cursor.complete:
+        console.print(
+            f"Following-list pass: complete ({cursor.scanned_count} scanned)",
+            soft_wrap=True,
+        )
+    else:
+        console.print(
+            f"Following-list pass: {cursor.scanned_count} scanned; next batch ready",
+            soft_wrap=True,
+        )
 
 
 @app.command()
@@ -835,6 +897,7 @@ def check(
     else:
         token_store.save_oauth_credentials(replace(credentials, verified=True))
 
+    Storage(resolved_app_dir).save_connection_context(me.id, me.username)
     console.print(f"Connected as @{me.username} ({me.name}).", soft_wrap=True)
 
 
@@ -856,12 +919,104 @@ def scan(
         "--yes",
         help="Skip the estimated-cost confirmation.",
     ),
+    restart: bool = typer.Option(
+        False,
+        "--restart",
+        help="Start a new full following-list pass instead of continuing.",
+    ),
 ) -> None:
-    """Scan followed accounts and export candidate decisions."""
+    """Scan the next followed-account batch and export complete results."""
     resolved_app_dir = _resolve_app_dir(app_dir)
     config = _load_config_or_exit(_config_path(resolved_app_dir))
+    storage = Storage(resolved_app_dir)
+    cursor = storage.load_scan_cursor()
+    connection_context = storage.load_connection_context()
+    config_signature = _scan_config_signature(config)
+    account_changed = (
+        cursor is not None
+        and connection_context is not None
+        and cursor.source_user_id != connection_context["source_user_id"]
+    )
+
+    if account_changed and not restart:
+        if _interactive_tui and typer.confirm(
+            f"The connected account is @{connection_context['source_username']}, "
+            f"but the current pass belongs to @{cursor.source_username}. Start a "
+            "separate pass and replace the current working results? The historical "
+            "export is kept.",
+            default=False,
+        ):
+            restart = True
+        else:
+            console.print(
+                "The connected X account differs from the current scan pass. "
+                "Existing results were kept. Use `x-unfollow scan --restart` to "
+                "start a pass for the connected account.",
+                soft_wrap=True,
+            )
+            raise typer.Exit(2)
+    existing_records_without_cursor = cursor is None and bool(storage.load_decisions())
+
+    if existing_records_without_cursor and not restart:
+        if _interactive_tui and typer.confirm(
+            "Existing scan results have no resume cursor (for example from "
+            "X-Unfollow 0.1.x). Start a new pass and replace the current working "
+            "results? The historical export is kept.",
+            default=False,
+        ):
+            restart = True
+        else:
+            console.print(
+                "Existing results have no reusable X cursor and were kept. Use "
+                "`x-unfollow scan --restart` to begin a new pass.",
+                soft_wrap=True,
+            )
+            raise typer.Exit(2)
+
+    if cursor is not None and cursor.complete and not restart:
+        if _interactive_tui and typer.confirm(
+            f"The current pass is complete ({cursor.scanned_count} accounts). "
+            "Start a new pass from the beginning?",
+            default=False,
+        ):
+            restart = True
+        else:
+            console.print(
+                f"Following-list pass already complete: {cursor.scanned_count} "
+                "account(s). Use `x-unfollow scan --restart` to scan from the "
+                "beginning again.",
+                soft_wrap=True,
+            )
+            return
+
+    if (
+        cursor is not None
+        and not cursor.complete
+        and cursor.config_signature
+        and cursor.config_signature != config_signature
+        and not restart
+    ):
+        if _interactive_tui and typer.confirm(
+            "The scan rules changed during this pass. Start a new pass with the "
+            "new rules?",
+            default=False,
+        ):
+            restart = True
+        else:
+            console.print(
+                "The scan rules changed during the current pass. Resume was "
+                "blocked so results are not mixed. Use `x-unfollow scan --restart`.",
+                soft_wrap=True,
+            )
+            raise typer.Exit(2)
+
     effective_limit = limit or config.api.max_accounts_per_scan
     estimated_cost = _estimated_scan_cost_usd(config, limit)
+    if cursor is not None and not restart:
+        console.print(
+            f"Continuing the current pass after {cursor.scanned_count} account(s).",
+            soft_wrap=True,
+        )
     console.print(
         f"Scanning up to {effective_limit} account(s). "
         f"Estimated worst-case API read cost: ${estimated_cost:.2f}.",
@@ -920,11 +1075,46 @@ def scan(
         token = _load_access_token(resolved_app_dir)
         with XApiClient(token) as api:
             me = api.get_me()
-            records = scan_accounts(
+            if cursor is not None and cursor.source_user_id != me.id and not restart:
+                if _interactive_tui and typer.confirm(
+                    f"The live X login is @{me.username}, but the current pass "
+                    f"belongs to @{cursor.source_username}. Start a separate pass "
+                    "and replace the current working results? The historical "
+                    "export is kept.",
+                    default=False,
+                ):
+                    restart = True
+                else:
+                    console.print(
+                        "The live X account differs from the current scan pass. "
+                        "No followed accounts were scanned and existing results "
+                        "were kept. Run again with `x-unfollow scan --restart`.",
+                        soft_wrap=True,
+                    )
+                    raise typer.Exit(2)
+            continuing = (
+                cursor is not None
+                and not restart
+                and not cursor.complete
+                and cursor.source_user_id == me.id
+            )
+            if cursor is not None and not restart and cursor.source_user_id != me.id:
+                console.print(
+                    "The connected X account changed. Starting a separate scan pass "
+                    f"for @{me.username}.",
+                    soft_wrap=True,
+                )
+            scan_started_at = datetime.now(timezone.utc)
+            cycle_id = cursor.cycle_id if continuing else uuid4().hex
+            cycle_started_at = cursor.started_at if continuing else scan_started_at
+            previous_count = cursor.scanned_count if continuing else 0
+            batch_number = (cursor.batch_number + 1) if continuing else 1
+            batch = scan_account_batch(
                 api,
                 me.id,
                 config,
                 limit=limit,
+                pagination_token=cursor.next_token if continuing else None,
                 progress=print_progress,
             )
     except MissingTokenError as exc:
@@ -934,20 +1124,68 @@ def scan(
         _print_cli_error(exc)
         raise typer.Exit(1) from exc
     except XApiError as exc:
+        if cursor is not None and not restart and exc.status_code == 400:
+            console.print(
+                "X rejected the saved following-list cursor. Your existing "
+                "results were kept. Start a fresh pass with "
+                "`x-unfollow scan --restart`.",
+                soft_wrap=True,
+            )
         _print_api_error(exc)
         raise typer.Exit(1) from exc
 
-    storage = Storage(resolved_app_dir)
+    run_id = uuid4().hex
+    scanned_at = datetime.now(timezone.utc)
+    batch_records = [
+        replace(
+            record,
+            scanned_at=scanned_at,
+            scan_run_id=run_id,
+            scan_cycle_id=cycle_id,
+            scan_batch_number=batch_number,
+            scan_position=previous_count + position,
+        )
+        for position, record in enumerate(batch.records, start=1)
+    ]
+    existing_records = storage.load_decisions() if continuing else []
+    records = _merge_scan_records(existing_records, batch_records)
+    updated_cursor = ScanCursor(
+        source_user_id=me.id,
+        source_username=me.username,
+        cycle_id=cycle_id,
+        started_at=cycle_started_at,
+        updated_at=scanned_at,
+        scanned_count=previous_count + len(batch_records),
+        batch_number=batch_number,
+        next_token=batch.next_token,
+        complete=batch.next_token is None,
+        config_signature=config_signature,
+    )
+
     storage.save_decisions(records)
+    storage.save_connection_context(me.id, me.username)
     storage.save_scan_context(me.id, me.username)
-    export_path = storage.export_candidates_csv(records)
+    candidates_path = storage.export_candidates_csv(records)
+    results_path = storage.export_scan_results(records, config)
+    history_path = storage.append_scan_history(batch_records, config)
+    storage.save_scan_cursor(updated_cursor)
     candidate_count = sum(1 for record in records if record.decision == "candidate")
 
     if _interactive_tui:
         _render_tui_header("SCAN COMPLETE")
-    console.print(f"Scanned {len(records)} account(s).", soft_wrap=True)
-    console.print(f"Candidates: {candidate_count}", soft_wrap=True)
-    console.print(f"Export: {export_path}", soft_wrap=True)
+    console.print(f"Scanned this batch: {len(batch_records)} account(s).", soft_wrap=True)
+    console.print(
+        f"Current pass total: {updated_cursor.scanned_count} account(s).",
+        soft_wrap=True,
+    )
+    console.print(f"Candidates in current pass: {candidate_count}", soft_wrap=True)
+    if updated_cursor.complete:
+        console.print("Following-list pass complete.", soft_wrap=True)
+    else:
+        console.print("Next run will continue with the next batch.", soft_wrap=True)
+    console.print(f"Full results: {results_path}", soft_wrap=True)
+    console.print(f"Scan history: {history_path}", soft_wrap=True)
+    console.print(f"Candidates: {candidates_path}", soft_wrap=True)
 
 
 @app.command()
@@ -1034,6 +1272,7 @@ def review(
                 console.print(str(exc), soft_wrap=True)
                 continue
             storage.save_decisions(records)
+            storage.export_candidates_csv(records)
             if choice == "u":
                 console.print(
                     f"Marked @{record.user.username} for unfollow. "
@@ -1175,6 +1414,7 @@ def unfollow(
             for record in records
         ]
         storage.save_decisions(updated_records)
+        storage.export_candidates_csv(updated_records)
         attempted_ids = successful_ids | set(failures)
         timestamp = datetime.now(timezone.utc)
         storage.append_unfollow_audit(
