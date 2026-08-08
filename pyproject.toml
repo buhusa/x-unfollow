@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "x-unfollow"
-version = "0.2.0"
-description = "API-only CLI for reviewing and unfollowing inactive X accounts"
+version = "0.3.0"
+description = "Low-cost CLI for reviewing and unfollowing inactive X accounts"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }

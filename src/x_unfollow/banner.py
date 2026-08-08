@@ -6,9 +6,9 @@ BANNER = r"""
           \___/|_| \_|_|   \___/|_____|_____\___/  \_/\_/
 """.strip("\n")
 
-ABOUT = """x-unfollow is an API-only terminal tool for reviewing inactive X accounts before unfollowing them.
+ABOUT = """x-unfollow is a low-cost, API-only terminal tool for reviewing inactive X accounts before unfollowing them.
 
-It uses official X API data only: no browser scraping, no unofficial browser automation, and no LLM decisions. The default workflow is review-first, so accounts must be marked before an unfollow run can act on them.
+It checks the latest activity timestamp from your Following data and performs no Post reads. There is no browser scraping, unofficial browser automation, or LLM decisions. Every unfollow remains review-first and requires explicit confirmation.
 
 Created by @buhusa
 Website: https://buhussy.xyz

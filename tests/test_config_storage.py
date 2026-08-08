@@ -12,7 +12,6 @@ from x_unfollow.config import (
 from x_unfollow.models import (
     ApiConfig,
     AppConfig,
-    CombinationMode,
     DecisionRecord,
     RuleConfig,
     ScanCursor,
@@ -27,25 +26,17 @@ def test_write_and_load_default_config(tmp_path):
     config_path = tmp_path / "config.toml"
     write_default_config(config_path)
     config = load_config(config_path)
-    assert config.rules.own_post_threshold_days == 180
-    assert config.rules.combination == CombinationMode.AND
+    assert config.rules.activity_threshold_days == 180
     assert config.api.max_accounts_per_scan == 10
-    assert config.api.max_tweet_pages_per_user == 1
     assert config.api.max_scan_cost_usd == 0.50
 
 
 def test_write_config_round_trips_custom_values(tmp_path):
     path = tmp_path / "config.toml"
     expected = AppConfig(
-        rules=RuleConfig(
-            own_post_threshold_days=90,
-            reply_threshold_days=30,
-            combination=CombinationMode.OR,
-        ),
+        rules=RuleConfig(activity_threshold_days=90),
         api=ApiConfig(
             page_size_following=100,
-            page_size_tweets=5,
-            max_tweet_pages_per_user=2,
             max_accounts_per_scan=3,
         ),
     )
@@ -69,35 +60,16 @@ def test_environment_overrides_config_file_values(tmp_path, monkeypatch):
         "\n".join(
             [
                 "[rules]",
-                "own_post_threshold_days = 180",
-                'combination = "and"',
+                "activity_threshold_days = 180",
             ]
         ),
         encoding="utf-8",
     )
-    monkeypatch.setenv("X_UNFOLLOW_COMBINATION", "or")
-    monkeypatch.setenv("X_UNFOLLOW_OWN_POST_THRESHOLD_DAYS", "90")
+    monkeypatch.setenv("X_UNFOLLOW_ACTIVITY_THRESHOLD_DAYS", "90")
 
     config = load_config(config_path)
 
-    assert config.rules.combination == CombinationMode.OR
-    assert config.rules.own_post_threshold_days == 90
-
-
-@pytest.mark.parametrize("max_pages", [0, -1])
-def test_api_config_rejects_non_positive_max_tweet_pages(max_pages):
-    with pytest.raises(ValueError, match="max_tweet_pages_per_user"):
-        ApiConfig(max_tweet_pages_per_user=max_pages)
-
-
-def test_api_config_rejects_non_positive_page_size_tweets():
-    with pytest.raises(ValueError, match="page_size_tweets"):
-        ApiConfig(page_size_tweets=0)
-
-
-def test_api_config_rejects_tweet_page_size_outside_x_api_range():
-    with pytest.raises(ValueError, match="page_size_tweets"):
-        ApiConfig(page_size_tweets=101)
+    assert config.rules.activity_threshold_days == 90
 
 
 def test_boolean_environment_overrides_parse_true_false(tmp_path, monkeypatch):
@@ -105,24 +77,16 @@ def test_boolean_environment_overrides_parse_true_false(tmp_path, monkeypatch):
     config_path.write_text(
         "\n".join(
             [
-                "[rules]",
-                "count_retweets_as_activity = false",
-                "count_quote_posts_as_own_posts = true",
-                "",
                 "[safety]",
                 "require_review_before_unfollow = true",
             ]
         ),
         encoding="utf-8",
     )
-    monkeypatch.setenv("X_UNFOLLOW_COUNT_RETWEETS_AS_ACTIVITY", "true")
-    monkeypatch.setenv("X_UNFOLLOW_COUNT_QUOTE_POSTS_AS_OWN_POSTS", "false")
     monkeypatch.setenv("X_UNFOLLOW_REQUIRE_REVIEW_BEFORE_UNFOLLOW", "false")
 
     config = load_config(config_path)
 
-    assert config.rules.count_retweets_as_activity is True
-    assert config.rules.count_quote_posts_as_own_posts is False
     assert config.safety.require_review_before_unfollow is False
 
 
@@ -130,20 +94,17 @@ def test_storage_round_trip_decisions(tmp_path):
     storage = Storage(tmp_path)
     record = DecisionRecord(
         user=XUser(id="1", username="quiet", name="Quiet"),
-        last_own_post_at=datetime(2025, 1, 1, tzinfo=timezone.utc),
-        days_since_own_post=523,
-        last_reply_at=None,
-        days_since_reply=None,
-        rule_match_own_post=True,
-        rule_match_reply=True,
         decision="candidate",
         reason="test",
+        last_activity_at=datetime(2025, 1, 1, tzinfo=timezone.utc),
+        days_since_activity=523,
+        last_activity_id="123",
         account_status="ok",
     )
     storage.save_decisions([record])
     loaded = storage.load_decisions()
     assert loaded[0].user.username == "quiet"
-    assert loaded[0].last_own_post_at == datetime(2025, 1, 1, tzinfo=timezone.utc)
+    assert loaded[0].last_activity_at == datetime(2025, 1, 1, tzinfo=timezone.utc)
     assert loaded[0].account_status == "ok"
 
 
@@ -187,14 +148,11 @@ def test_storage_write_methods_create_only_needed_directories(tmp_path):
     storage = Storage(tmp_path)
     record = DecisionRecord(
         user=XUser(id="1", username="quiet", name="Quiet"),
-        last_own_post_at=None,
-        days_since_own_post=None,
-        last_reply_at=None,
-        days_since_reply=None,
-        rule_match_own_post=True,
-        rule_match_reply=True,
         decision="candidate",
         reason="test",
+        last_activity_at=datetime(2025, 1, 1, tzinfo=timezone.utc),
+        days_since_activity=523,
+        last_activity_id="123",
     )
 
     storage.save_decisions([record])
@@ -241,6 +199,20 @@ def test_storage_round_trips_scan_account_context(tmp_path):
     assert storage.load_connection_context() == {
         "source_user_id": "456",
         "source_username": "connected",
+    }
+
+    refreshed_at = datetime(2026, 8, 8, 12, 0, tzinfo=timezone.utc)
+    storage.save_connection_context(
+        "456",
+        "connected",
+        following_count=606,
+        following_refreshed_at=refreshed_at,
+    )
+    assert storage.load_connection_context() == {
+        "source_user_id": "456",
+        "source_username": "connected",
+        "following_count": 606,
+        "following_refreshed_at": refreshed_at.isoformat(),
     }
 
 
@@ -302,14 +274,11 @@ def test_storage_exports_candidates_csv(tmp_path):
     storage = Storage(tmp_path)
     record = DecisionRecord(
         user=XUser(id="1", username="quiet", name="Quiet"),
-        last_own_post_at=datetime(2025, 1, 1, tzinfo=timezone.utc),
-        days_since_own_post=523,
-        last_reply_at=None,
-        days_since_reply=None,
-        rule_match_own_post=True,
-        rule_match_reply=True,
         decision="candidate",
         reason="test reason",
+        last_activity_at=datetime(2025, 1, 1, tzinfo=timezone.utc),
+        days_since_activity=523,
+        last_activity_id="123",
         review="unfollow",
         account_status="ok",
     )
@@ -329,26 +298,20 @@ def test_storage_exports_only_candidate_records(tmp_path):
     storage = Storage(tmp_path)
     candidate = DecisionRecord(
         user=XUser(id="1", username="quiet", name="Quiet"),
-        last_own_post_at=datetime(2025, 1, 1, tzinfo=timezone.utc),
-        days_since_own_post=523,
-        last_reply_at=None,
-        days_since_reply=None,
-        rule_match_own_post=True,
-        rule_match_reply=True,
         decision="candidate",
         reason="candidate reason",
+        last_activity_at=datetime(2025, 1, 1, tzinfo=timezone.utc),
+        days_since_activity=523,
+        last_activity_id="123",
         review="unfollow",
     )
     keep = DecisionRecord(
         user=XUser(id="2", username="active", name="Active"),
-        last_own_post_at=datetime(2026, 6, 1, tzinfo=timezone.utc),
-        days_since_own_post=7,
-        last_reply_at=datetime(2026, 6, 2, tzinfo=timezone.utc),
-        days_since_reply=6,
-        rule_match_own_post=False,
-        rule_match_reply=False,
         decision="keep",
         reason="keep reason",
+        last_activity_at=datetime(2026, 6, 2, tzinfo=timezone.utc),
+        days_since_activity=6,
+        last_activity_id="456",
     )
 
     export_path = storage.export_candidates_csv([candidate, keep])
@@ -364,16 +327,11 @@ def test_storage_exports_all_scan_results_with_evidence_urls_and_rule_snapshot(
     storage = Storage(tmp_path)
     record = DecisionRecord(
         user=XUser(id="1", username="quiet", name="\t=Formula"),
-        last_own_post_at=datetime(2025, 1, 1, tzinfo=timezone.utc),
-        days_since_own_post=584,
-        last_reply_at=datetime(2025, 1, 2, tzinfo=timezone.utc),
-        days_since_reply=583,
-        rule_match_own_post=True,
-        rule_match_reply=True,
         decision="candidate",
         reason="inactive",
-        last_own_post_id="post-1",
-        last_reply_id="reply-1",
+        last_activity_at=datetime(2025, 1, 2, tzinfo=timezone.utc),
+        days_since_activity=583,
+        last_activity_id="activity-1",
         scanned_at=datetime(2026, 8, 8, tzinfo=timezone.utc),
         scan_run_id="run-1",
         scan_cycle_id="cycle-1",
@@ -387,12 +345,38 @@ def test_storage_exports_all_scan_results_with_evidence_urls_and_rule_snapshot(
 
     results = results_path.read_text(encoding="utf-8")
     history = history_path.read_text(encoding="utf-8")
-    assert "https://x.com/quiet/status/post-1" in results
-    assert "https://x.com/quiet/status/reply-1" in results
-    assert "own_post_threshold_days" in results
+    assert "https://x.com/quiet/status/activity-1" in results
+    assert "activity_threshold_days" in results
+    assert "own_post_threshold_days" not in results
     assert "180" in results
     assert "'\t=Formula" in results
     assert "run-1" in history
     assert len(history_path.read_text(encoding="utf-8").splitlines()) == 2
     assert stat.S_IMODE(results_path.stat().st_mode) == 0o600
     assert stat.S_IMODE(history_path.stat().st_mode) == 0o600
+
+
+def test_scan_history_projects_legacy_rows_onto_current_export_schema(tmp_path):
+    storage = Storage(tmp_path)
+    storage.exports_dir.mkdir(parents=True)
+    storage.scan_history_export_path.write_text(
+        "id,username,own_post_threshold_days\n1,legacy,180\n",
+        encoding="utf-8",
+    )
+    record = DecisionRecord(
+        user=XUser(id="2", username="current", name="Current"),
+        decision="keep",
+        reason="recent activity",
+        last_activity_at=datetime(2026, 8, 1, tzinfo=timezone.utc),
+        days_since_activity=7,
+        last_activity_id="123",
+        scan_cycle_id="cycle-2",
+        scan_position=1,
+    )
+
+    storage.append_scan_history([record], AppConfig())
+
+    content = storage.scan_history_export_path.read_text(encoding="utf-8")
+    assert "own_post_threshold_days" not in content
+    assert "legacy" in content
+    assert "current" in content

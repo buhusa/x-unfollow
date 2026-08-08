@@ -1,4 +1,5 @@
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -17,15 +18,13 @@ def record(
 ) -> DecisionRecord:
     return DecisionRecord(
         user=XUser(id=user_id or username, username=username, name=username.title()),
-        last_own_post_at=None,
-        days_since_own_post=None,
-        last_reply_at=None,
-        days_since_reply=None,
-        rule_match_own_post=True,
-        rule_match_reply=True,
         decision=decision,
         reason="test",
+        last_activity_at=datetime(2025, 1, 1, tzinfo=timezone.utc),
+        days_since_activity=584,
+        last_activity_id="123",
         account_status=account_status,
+        scanned_at=datetime.now(timezone.utc),
     )
 
 
@@ -127,6 +126,48 @@ def test_execute_unfollows_calls_only_reviewed_ok_candidates_after_cap():
     assert result.failed_count == 0
     assert result.dry_run is False
     assert api.calls == [("me", "one"), ("me", "two")]
+
+
+def test_execute_unfollows_rejects_cheap_record_without_activity_evidence():
+    api = FakeUnfollowApi()
+    unsafe = replace(
+        record("unsafe"),
+        last_activity_at=None,
+        days_since_activity=None,
+        last_activity_id=None,
+        review="unfollow",
+    )
+
+    result = execute_unfollows(
+        api,
+        "me",
+        [unsafe],
+        SafetyConfig(),
+        dry_run=False,
+    )
+
+    assert result.attempted_count == 0
+    assert api.calls == []
+
+
+def test_execute_unfollows_rejects_stale_scan_evidence():
+    api = FakeUnfollowApi()
+    stale = replace(
+        record("stale"),
+        review="unfollow",
+        scanned_at=datetime.now(timezone.utc) - timedelta(hours=25),
+    )
+
+    result = execute_unfollows(
+        api,
+        "me",
+        [stale],
+        SafetyConfig(max_evidence_age_hours=24),
+        dry_run=False,
+    )
+
+    assert result.attempted_count == 0
+    assert api.calls == []
 
 
 def test_execute_unfollows_counts_failed_api_results():

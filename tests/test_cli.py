@@ -6,7 +6,12 @@ from typer.testing import CliRunner
 import x_unfollow.cli as cli
 from x_unfollow.cli import app
 from x_unfollow.config import load_config
-from x_unfollow.models import CombinationMode, DecisionRecord, XUser
+from x_unfollow.models import (
+    AppConfig,
+    DecisionRecord,
+    ScanCursor,
+    XUser,
+)
 from x_unfollow.storage import Storage
 
 
@@ -16,14 +21,12 @@ runner = CliRunner()
 def record(username: str = "quiet") -> DecisionRecord:
     return DecisionRecord(
         user=XUser(id=username, username=username, name=username.title()),
-        last_own_post_at=None,
-        days_since_own_post=None,
-        last_reply_at=None,
-        days_since_reply=None,
-        rule_match_own_post=True,
-        rule_match_reply=True,
         decision="candidate",
         reason="test",
+        last_activity_at=datetime(2025, 1, 1, tzinfo=timezone.utc),
+        days_since_activity=584,
+        last_activity_id="123",
+        scanned_at=datetime.now(timezone.utc),
     )
 
 
@@ -34,7 +37,8 @@ def test_about_shows_banner_and_safety_positioning():
     assert "x-unfollow" in result.output
     assert "API-only" in result.output
     assert "no browser scraping" in result.output
-    assert "no LLM decisions" in result.output
+    assert "LLM" in result.output
+    assert "decisions" in result.output
     assert "review-first" in result.output
     assert "https://buhussy.xyz" in result.output
     assert "https://x.com/buhusa" in result.output
@@ -48,20 +52,23 @@ def test_config_init_writes_config(tmp_path):
     assert result.exit_code == 0
     config_path = app_dir / "config.toml"
     assert config_path.exists()
-    assert 'combination = "and"' in config_path.read_text(encoding="utf-8")
+    assert "activity_threshold_days = 180" in config_path.read_text(encoding="utf-8")
 
 
 def test_config_init_preserves_existing_config(tmp_path):
     app_dir = tmp_path / "state"
     config_path = app_dir / "config.toml"
     app_dir.mkdir()
-    config_path.write_text("# keep me\n[rules]\ncombination = \"or\"\n", encoding="utf-8")
+    config_path.write_text(
+        "# keep me\n[rules]\nactivity_threshold_days = 90\n",
+        encoding="utf-8",
+    )
 
     result = runner.invoke(app, ["config", "init", "--app-dir", str(app_dir)])
 
     assert result.exit_code == 0
     assert config_path.read_text(encoding="utf-8") == (
-        "# keep me\n[rules]\ncombination = \"or\"\n"
+        "# keep me\n[rules]\nactivity_threshold_days = 90\n"
     )
 
 
@@ -69,16 +76,11 @@ def test_config_edit_updates_values_from_guided_prompts(tmp_path):
     app_dir = tmp_path / "state"
     user_input = "\n".join(
         [
-            "90",
-            "30",
-            "or",
-            "n",
-            "y",
+            "180",
             "3",
-            "5",
-            "2",
             "0.25",
             "10",
+            "24",
             "",
         ]
     )
@@ -92,14 +94,11 @@ def test_config_edit_updates_values_from_guided_prompts(tmp_path):
     assert result.exit_code == 0
     assert "Config saved" in result.output
     config = load_config(app_dir / "config.toml")
-    assert config.rules.own_post_threshold_days == 90
-    assert config.rules.reply_threshold_days == 30
-    assert config.rules.combination == CombinationMode.OR
+    assert config.rules.activity_threshold_days == 180
     assert config.api.max_accounts_per_scan == 3
-    assert config.api.page_size_tweets == 5
-    assert config.api.max_tweet_pages_per_user == 2
     assert config.api.max_scan_cost_usd == 0.25
     assert config.safety.max_unfollows_per_run == 10
+    assert config.safety.max_evidence_age_hours == 24
 
 
 def test_status_empty_app_dir_renders_counts_without_stack_trace(tmp_path):
@@ -110,13 +109,12 @@ def test_status_empty_app_dir_renders_counts_without_stack_trace(tmp_path):
     assert result.exit_code == 0
     assert str(app_dir / "config.toml") in result.output
     assert "X connection: not connected" in result.output
-    assert "and" in result.output
-    assert "Own-post threshold: 180 days" in result.output
-    assert "Reply threshold: 180 days" in result.output
+    assert "Any-activity threshold: 180 days" in result.output
     assert "Maximum accounts per scan: 10" in result.output
     assert "Hard scan budget: $0.50" in result.output
     assert "Candidate count" in result.output
     assert "Marked unfollow count" in result.output
+    assert "Current following count: not refreshed yet" in result.output
     assert "0" in result.output
     assert "Traceback" not in result.output
     assert not (app_dir / "data").exists()
@@ -127,7 +125,7 @@ def test_status_malformed_config_exits_2_with_friendly_message(tmp_path):
     app_dir = tmp_path / "state"
     config_path = app_dir / "config.toml"
     app_dir.mkdir()
-    config_path.write_text("[rules]\ncombination = \"xor\"\n", encoding="utf-8")
+    config_path.write_text("[rules]\nactivity_threshold_days = 0\n", encoding="utf-8")
 
     result = runner.invoke(app, ["status", "--app-dir", str(app_dir)])
 
@@ -158,11 +156,60 @@ def test_status_distinguishes_unverified_oauth_login(tmp_path):
     assert "OAuth 2.0 login saved, connection test pending" in result.output
 
 
+def test_completed_scan_is_labeled_as_saved_snapshot_not_live_count(tmp_path):
+    app_dir = tmp_path / "state"
+    storage = Storage(app_dir)
+    now = datetime.now(timezone.utc)
+    storage.save_decisions([record("quiet")])
+    storage.save_scan_cursor(
+        ScanCursor(
+            source_user_id="123",
+            source_username="owner",
+            cycle_id="cycle-1",
+            started_at=now,
+            updated_at=now,
+            scanned_count=652,
+            batch_number=1,
+            next_token=None,
+            complete=True,
+        )
+    )
+
+    _account, scan_line, _next, _recommended = cli._menu_status(app_dir)
+    result = runner.invoke(app, ["status", "--app-dir", str(app_dir)])
+
+    assert scan_line.startswith("Last scan snapshot: 652 accounts")
+    assert result.exit_code == 0
+    assert "Last completed scan snapshot: 652 accounts" in result.output
+    assert "not a live X following count" in result.output
+
+
+def test_menu_status_shows_cached_live_following_count(tmp_path, monkeypatch):
+    app_dir = tmp_path / "state"
+    now = datetime.now(timezone.utc)
+    Storage(app_dir).save_connection_context(
+        "123",
+        "buhusa",
+        following_count=606,
+        following_refreshed_at=now,
+    )
+    monkeypatch.setattr(cli, "_has_verified_oauth_login", lambda _path: True)
+
+    account_line, _scan, _next, _recommended = cli._menu_status(app_dir)
+
+    assert "OAuth: connected as @buhusa" in account_line
+    assert "Following now: 606 (just now)" in account_line
+
+    result = runner.invoke(app, ["status", "--app-dir", str(app_dir)])
+    assert result.exit_code == 0
+    assert "Current following count: 606 (just now)" in result.output
+
+
 def test_unfollow_malformed_config_exits_2_with_friendly_message(tmp_path):
     app_dir = tmp_path / "state"
     config_path = app_dir / "config.toml"
     app_dir.mkdir()
-    config_path.write_text("[rules]\ncombination = \"xor\"\n", encoding="utf-8")
+    config_path.write_text("[rules]\nactivity_threshold_days = 0\n", encoding="utf-8")
 
     result = runner.invoke(app, ["unfollow", "--app-dir", str(app_dir), "--dry-run"])
 
@@ -222,8 +269,8 @@ def test_review_shows_activity_timestamp_and_age(tmp_path):
         [
             replace(
                 record("quiet"),
-                last_own_post_at=activity_at,
-                days_since_own_post=208,
+                last_activity_at=activity_at,
+                days_since_activity=208,
             )
         ]
     )
@@ -235,8 +282,16 @@ def test_review_shows_activity_timestamp_and_age(tmp_path):
     )
 
     assert result.exit_code == 0
-    assert "Last own post: 2026-01-02 03:04 UTC (208 days ago)" in result.output
-    assert "Last reply: not found in scanned activity" in result.output
+    assert "Last X activity: 2026-01-02 03:04 UTC (208 days ago)" in result.output
+
+
+def test_super_cheap_cost_estimate_has_no_post_read_cost():
+    estimate = cli._estimated_scan_cost_usd(
+        AppConfig(),
+        limit=655,
+    )
+
+    assert estimate == 0.665
 
 
 def test_review_excludes_candidate_with_contradictory_missing_activity(tmp_path):
@@ -244,6 +299,9 @@ def test_review_excludes_candidate_with_contradictory_missing_activity(tmp_path)
     unsafe_record = replace(
         record("active"),
         user=replace(record("active").user, most_recent_tweet_id="recent-post"),
+        last_activity_at=None,
+        days_since_activity=None,
+        last_activity_id=None,
     )
     Storage(app_dir).save_decisions([unsafe_record])
 
@@ -329,13 +387,29 @@ def test_tui_number_key_opens_item_directly(monkeypatch):
     assert choice == "8"
 
 
+def test_tui_r_key_refreshes_following_count(monkeypatch):
+    monkeypatch.setattr(cli.readchar, "readkey", lambda: "R")
+
+    selected_index, choice = cli._read_tui_menu_choice(0)
+
+    assert selected_index == 0
+    assert choice == "r"
+
+
+def test_text_menu_scan_shortcut_dispatches_without_key_error(monkeypatch):
+    calls = []
+    monkeypatch.setattr(cli, "_run_scan_from_menu", lambda: calls.append("scan"))
+
+    cli._run_menu_action("s")
+
+    assert calls == ["scan"]
+
+
 def test_merge_scan_records_replaces_duplicate_and_resets_destructive_review():
     older = replace(record("quiet"), review="unfollow")
     newer = replace(
         record("quiet"),
         decision="keep",
-        rule_match_own_post=False,
-        rule_match_reply=False,
     )
 
     merged = cli._merge_scan_records([older], [newer])

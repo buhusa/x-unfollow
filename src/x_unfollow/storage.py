@@ -3,7 +3,7 @@ from __future__ import annotations
 import csv
 import json
 from dataclasses import asdict
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -97,18 +97,13 @@ class Storage:
             records.append(
                 DecisionRecord(
                     user=XUser(**user_raw),
-                    last_own_post_at=_parse_dt(item.get("last_own_post_at")),
-                    days_since_own_post=item.get("days_since_own_post"),
-                    last_reply_at=_parse_dt(item.get("last_reply_at")),
-                    days_since_reply=item.get("days_since_reply"),
-                    rule_match_own_post=bool(item["rule_match_own_post"]),
-                    rule_match_reply=bool(item["rule_match_reply"]),
                     decision=item["decision"],
                     reason=item["reason"],
+                    last_activity_at=_parse_dt(item.get("last_activity_at")),
+                    days_since_activity=item.get("days_since_activity"),
+                    last_activity_id=item.get("last_activity_id"),
                     review=item.get("review", "pending"),
                     account_status=item.get("account_status", "ok"),
-                    last_own_post_id=item.get("last_own_post_id"),
-                    last_reply_id=item.get("last_reply_id"),
                     scanned_at=_parse_dt(item.get("scanned_at")),
                     scan_run_id=item.get("scan_run_id"),
                     scan_cycle_id=item.get("scan_cycle_id"),
@@ -170,13 +165,29 @@ class Storage:
             return None
         return {"source_user_id": user_id, "source_username": username}
 
-    def save_connection_context(self, user_id: str, username: str) -> None:
+    def save_connection_context(
+        self,
+        user_id: str,
+        username: str,
+        *,
+        following_count: int | None = None,
+        following_refreshed_at: datetime | None = None,
+    ) -> None:
+        payload: dict[str, Any] = {
+            "source_user_id": user_id,
+            "source_username": username,
+        }
+        if following_count is not None:
+            payload["following_count"] = following_count
+            payload["following_refreshed_at"] = (
+                following_refreshed_at or datetime.now(timezone.utc)
+            )
         _write_json(
             self.connection_context_path,
-            {"source_user_id": user_id, "source_username": username},
+            payload,
         )
 
-    def load_connection_context(self) -> dict[str, str] | None:
+    def load_connection_context(self) -> dict[str, Any] | None:
         if not self.connection_context_path.exists():
             return None
         try:
@@ -191,7 +202,17 @@ class Storage:
         username = str(payload.get("source_username", "")).strip()
         if not user_id or not username:
             return None
-        return {"source_user_id": user_id, "source_username": username}
+        context: dict[str, Any] = {
+            "source_user_id": user_id,
+            "source_username": username,
+        }
+        following_count = payload.get("following_count")
+        if isinstance(following_count, int) and not isinstance(following_count, bool):
+            context["following_count"] = following_count
+            refreshed_at = payload.get("following_refreshed_at")
+            if isinstance(refreshed_at, str) and refreshed_at:
+                context["following_refreshed_at"] = refreshed_at
+        return context
 
     def append_unfollow_audit(self, entries: list[dict[str, Any]]) -> None:
         if not entries:
@@ -248,7 +269,13 @@ class Storage:
         _write_csv(
             self.scan_history_export_path,
             headers,
-            [*existing_rows, *new_rows],
+            [
+                *(
+                    {header: row.get(header, "") for header in headers}
+                    for row in existing_rows
+                ),
+                *new_rows,
+            ],
         )
         return self.scan_history_export_path
 
@@ -267,29 +294,17 @@ def _scan_export_headers(*, include_rules: bool) -> list[str]:
         "decision",
         "account_status",
         "reason",
-        "last_own_post_at",
-        "days_since_own_post",
-        "last_own_post_id",
-        "last_own_post_url",
-        "last_reply_at",
-        "days_since_reply",
-        "last_reply_id",
-        "last_reply_url",
-        "rule_match_own_post",
-        "rule_match_reply",
+        "last_activity_at",
+        "days_since_activity",
+        "last_activity_id",
+        "last_activity_url",
         "protected",
         "verified",
     ]
     if include_rules:
         headers.extend(
             [
-                "own_post_threshold_days",
-                "reply_threshold_days",
-                "combination",
-                "count_retweets_as_activity",
-                "count_quote_posts_as_own_posts",
-                "timeline_page_size",
-                "timeline_page_limit",
+                "activity_threshold_days",
             ]
         )
     else:
@@ -327,18 +342,12 @@ def _scan_export_row(
         "account_status": record.account_status,
         "review": record.review,
         "reason": _csv_safe(record.reason),
-        "last_own_post_at": _encode(record.last_own_post_at),
-        "days_since_own_post": record.days_since_own_post,
-        "last_own_post_id": record.last_own_post_id,
-        "last_own_post_url": _post_url(
-            record.user.username, record.last_own_post_id
+        "last_activity_at": _encode(record.last_activity_at),
+        "days_since_activity": record.days_since_activity,
+        "last_activity_id": record.last_activity_id,
+        "last_activity_url": _post_url(
+            record.user.username, record.last_activity_id
         ),
-        "last_reply_at": _encode(record.last_reply_at),
-        "days_since_reply": record.days_since_reply,
-        "last_reply_id": record.last_reply_id,
-        "last_reply_url": _post_url(record.user.username, record.last_reply_id),
-        "rule_match_own_post": record.rule_match_own_post,
-        "rule_match_reply": record.rule_match_reply,
         "protected": record.user.protected,
         "verified": record.user.verified,
     }
@@ -346,15 +355,7 @@ def _scan_export_row(
         row.pop("review")
         row.update(
             {
-                "own_post_threshold_days": config.rules.own_post_threshold_days,
-                "reply_threshold_days": config.rules.reply_threshold_days,
-                "combination": config.rules.combination.value,
-                "count_retweets_as_activity": config.rules.count_retweets_as_activity,
-                "count_quote_posts_as_own_posts": (
-                    config.rules.count_quote_posts_as_own_posts
-                ),
-                "timeline_page_size": config.api.page_size_tweets,
-                "timeline_page_limit": config.api.max_tweet_pages_per_user,
+                "activity_threshold_days": config.rules.activity_threshold_days,
             }
         )
     return row

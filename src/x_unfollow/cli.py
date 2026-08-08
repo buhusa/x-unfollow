@@ -23,7 +23,6 @@ from x_unfollow.config import (
 from x_unfollow.models import (
     ApiConfig,
     AppConfig,
-    CombinationMode,
     DecisionRecord,
     RuleConfig,
     ScanCursor,
@@ -40,7 +39,12 @@ from x_unfollow.review import apply_review_choice
 from x_unfollow.scanner import scan_account_batch
 from x_unfollow.storage import Storage
 from x_unfollow.tokens import MissingTokenError, OAuthCredentials, TokenStore
-from x_unfollow.unfollow import execute_unfollows
+from x_unfollow.unfollow import (
+    eligible_targets,
+    execute_unfollows,
+    has_activity_evidence,
+    has_fresh_evidence,
+)
 from x_unfollow.x_api import RateLimitError, XApiClient, XApiError
 
 
@@ -49,7 +53,6 @@ _interactive_tui = False
 
 USER_READ_COST_USD = 0.01
 OWNED_FOLLOWING_READ_COST_USD = 0.001
-POST_READ_COST_USD = 0.005
 
 app = typer.Typer(
     help="x-unfollow: review and unfollow inactive X accounts.",
@@ -101,23 +104,15 @@ def _load_config_or_exit(path: Path):
         raise typer.Exit(2) from exc
 
 
-def _eligible_unfollow_records(records: list[DecisionRecord]) -> list[DecisionRecord]:
-    return [
-        record
-        for record in records
-        if record.review == "unfollow"
-        and record.decision == "candidate"
-        and record.account_status == "ok"
-        and _has_activity_evidence(record)
-    ]
+def _eligible_unfollow_records(
+    records: list[DecisionRecord],
+    safety: SafetyConfig,
+) -> list[DecisionRecord]:
+    return eligible_targets(records, safety)
 
 
 def _has_activity_evidence(record: DecisionRecord) -> bool:
-    return not (
-        record.user.most_recent_tweet_id
-        and record.last_own_post_at is None
-        and record.last_reply_at is None
-    )
+    return has_activity_evidence(record)
 
 
 def _format_activity(value: datetime | None, days: int | None) -> str:
@@ -136,13 +131,9 @@ def _scan_config_signature(config: AppConfig) -> str:
     api = config.api
     return "|".join(
         [
-            str(rules.own_post_threshold_days),
-            str(rules.reply_threshold_days),
-            rules.combination.value,
-            str(rules.count_retweets_as_activity),
-            str(rules.count_quote_posts_as_own_posts),
-            str(api.page_size_tweets),
-            str(api.max_tweet_pages_per_user),
+            "activity-only-v1",
+            str(rules.activity_threshold_days),
+            str(api.page_size_following),
         ]
     )
 
@@ -220,14 +211,6 @@ def _prompt_positive_int(label: str, default: int) -> int:
         console.print("Please enter a number greater than 0.")
 
 
-def _prompt_int_range(label: str, default: int, minimum: int, maximum: int) -> int:
-    while True:
-        value = typer.prompt(label, default=default, type=int)
-        if minimum <= value <= maximum:
-            return value
-        console.print(f"Please enter a number from {minimum} to {maximum}.")
-
-
 def _prompt_positive_float(label: str, default: float) -> float:
     while True:
         value = typer.prompt(label, default=default, type=float)
@@ -236,37 +219,12 @@ def _prompt_positive_float(label: str, default: float) -> float:
         console.print("Please enter a number greater than 0.")
 
 
-def _prompt_combination(default: CombinationMode) -> CombinationMode:
-    while True:
-        value = typer.prompt(
-            "Rule combination [and/or]",
-            default=default.value,
-        ).strip().lower()
-        try:
-            return CombinationMode(value)
-        except ValueError:
-            console.print("Please enter 'and' or 'or'.")
-
-
-def _estimated_scan_cost_usd(config, limit: int | None) -> float:
+def _estimated_scan_cost_usd(
+    config: AppConfig,
+    limit: int | None,
+) -> float:
     account_count = limit or config.api.max_accounts_per_scan
-    latest_lookup_cost = 0.0
-    rules = config.rules
-    if (
-        rules.combination == CombinationMode.AND
-        and rules.own_post_threshold_days == rules.reply_threshold_days
-        and not rules.count_retweets_as_activity
-    ):
-        latest_lookup_cost = account_count * POST_READ_COST_USD
-    return (
-        USER_READ_COST_USD
-        + account_count * OWNED_FOLLOWING_READ_COST_USD
-        + latest_lookup_cost
-        + account_count
-        * config.api.page_size_tweets
-        * config.api.max_tweet_pages_per_user
-        * POST_READ_COST_USD
-    )
+    return USER_READ_COST_USD + account_count * OWNED_FOLLOWING_READ_COST_USD
 
 
 def _print_api_error(exc: XApiError) -> None:
@@ -293,14 +251,49 @@ def _should_print_api_access_guidance(exc: XApiError) -> bool:
     )
 
 
+def _following_count(user) -> int | None:
+    value = user.public_metrics.get("following_count")
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return None
+
+
+def _save_connection_snapshot(storage: Storage, user) -> None:
+    storage.save_connection_context(
+        user.id,
+        user.username,
+        following_count=_following_count(user),
+        following_refreshed_at=datetime.now(timezone.utc),
+    )
+
+
+def _format_refresh_age(value: object) -> str:
+    if not isinstance(value, str):
+        return "cached"
+    try:
+        refreshed_at = datetime.fromisoformat(value)
+        if refreshed_at.tzinfo is None:
+            refreshed_at = refreshed_at.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return "cached"
+    seconds = max(0, int((datetime.now(timezone.utc) - refreshed_at).total_seconds()))
+    if seconds < 60:
+        return "just now"
+    if seconds < 3600:
+        return f"{seconds // 60}m ago"
+    if seconds < 86400:
+        return f"{seconds // 3600}h ago"
+    return f"{seconds // 86400}d ago"
+
+
 MENU_ITEMS = (
-    ("WORKFLOW", "1", "Scan followed accounts", "Analyze your current following list"),
+    ("WORKFLOW", "1", "Scan followed accounts", "Any X activity counts"),
     ("WORKFLOW", "2", "Review and mark candidates", "No account is changed here"),
     ("WORKFLOW", "3", "Preview marked unfollows", "Dry run with no changes"),
     ("WORKFLOW", "4", "Execute marked unfollows", "Final confirmation required"),
-    ("SETUP", "5", "Rules, limits, and budget", "Configure matching and API spend"),
+    ("SETUP", "5", "Activity rule and limits", "Batch size, budget, and safety"),
     ("SETUP", "6", "Connect or change X account", "OAuth login and connection test"),
-    ("MORE", "7", "Detailed status", "Configuration and local counters"),
+    ("MORE", "7", "Status", "Configuration and local counters"),
     ("MORE", "8", "Export files", "Open the generated file list"),
     ("MORE", "9", "About", "Project and author information"),
 )
@@ -316,6 +309,13 @@ def _menu_status(app_dir: Path) -> tuple[str, str, str, str]:
 
     if connected and connection_context is not None:
         account_line = f"OAuth: connected as @{connection_context['source_username']}"
+        if "following_count" in connection_context:
+            age = _format_refresh_age(
+                connection_context.get("following_refreshed_at")
+            )
+            account_line += (
+                f" | Following now: {connection_context['following_count']} ({age})"
+            )
     elif connected and context is not None:
         account_line = (
             f"OAuth: connected | Last scan account: @{context['source_username']}"
@@ -343,11 +343,11 @@ def _menu_status(app_dir: Path) -> tuple[str, str, str, str]:
     pending_count = sum(1 for record in candidates if record.review == "pending")
     marked_count = sum(1 for record in candidates if record.review == "unfollow")
     if cursor is None:
-        progress_text = f"{len(records)} accounts"
+        progress_text = f"Last scan snapshot: {len(records)} accounts"
     elif cursor.complete:
-        progress_text = f"Pass complete: {cursor.scanned_count} accounts"
+        progress_text = f"Last scan snapshot: {cursor.scanned_count} accounts"
     else:
-        progress_text = f"Pass progress: {cursor.scanned_count} accounts"
+        progress_text = f"Current scan progress: {cursor.scanned_count} accounts"
     scan_line = (
         f"{progress_text} | {pending_count} to review | {marked_count} marked"
     )
@@ -403,7 +403,8 @@ def _print_menu(app_dir: Path, selected_index: int = 0) -> None:
     console.print(menu)
     console.print()
     console.print(
-        "UP/DOWN or j/k  Navigate    ENTER  Select    1-9  Open directly    q  Quit",
+        "UP/DOWN or j/k  Navigate  |  ENTER  Select  |  1-9  Open  |  "
+        "r  Refresh (~$0.01)  |  q  Quit",
         style="dim",
         markup=False,
     )
@@ -478,12 +479,22 @@ def _run_pending_connection_check(app_dir: Path) -> None:
         )
 
 
+def _run_scan_from_menu() -> None:
+    scan(None, None, False, False)
+
+
+def _refresh_following_count_from_menu() -> None:
+    refresh_following_count(None, True)
+
+
 def _run_menu_action(choice: str) -> None:
     actions = {
-        "1": lambda: scan(None, None, False, False),
-        "scan": lambda: scan(None, None, False, False),
+        "1": _run_scan_from_menu,
+        "s": _run_scan_from_menu,
+        "scan": _run_scan_from_menu,
         "2": lambda: review(None),
-        "r": lambda: review(None),
+        "r": _refresh_following_count_from_menu,
+        "refresh": _refresh_following_count_from_menu,
         "3": lambda: unfollow(None, True, False),
         "d": lambda: unfollow(None, True, False),
         "4": lambda: unfollow(None, False, False),
@@ -521,6 +532,8 @@ def _read_tui_menu_choice(selected_index: int) -> tuple[int, str | None]:
         return selected_index, MENU_ITEMS[selected_index][1]
     if pressed in {str(number) for number in range(1, 10)}:
         return _menu_index_for_key(pressed), pressed
+    if pressed in {"r", "R"}:
+        return selected_index, "r"
     if pressed in {"q", "Q", readchar.key.CTRL_C}:
         return selected_index, "q"
     return selected_index, None
@@ -592,6 +605,7 @@ def root(ctx: typer.Context) -> None:
                     "9",
                     "a",
                     "about",
+                    "refresh",
                 }
                 if choice not in valid_choices:
                     console.print("Please enter a menu number or q.")
@@ -658,68 +672,53 @@ def config_edit(
     current = _load_config_or_exit(path)
 
     console.print("Press Enter to keep the value shown in brackets.")
-    own_days = _prompt_positive_int(
-        "Own-post inactivity threshold (days)",
-        current.rules.own_post_threshold_days,
+    console.print()
+    console.print("ACTIVITY RULES", style="bold bright_cyan")
+    activity_days = _prompt_positive_int(
+        "Mark accounts inactive after this many days without any X activity",
+        current.rules.activity_threshold_days,
     )
-    reply_days = _prompt_positive_int(
-        "Reply inactivity threshold (days)",
-        current.rules.reply_threshold_days,
-    )
-    combination = _prompt_combination(current.rules.combination)
-    count_retweets = typer.confirm(
-        "Count reposts as activity?",
-        default=current.rules.count_retweets_as_activity,
-    )
-    count_quotes = typer.confirm(
-        "Count quote posts as own posts?",
-        default=current.rules.count_quote_posts_as_own_posts,
-    )
+    console.print()
+    console.print("SCAN SIZE AND API BUDGET", style="bold bright_cyan")
     max_accounts = _prompt_positive_int(
-        "Maximum accounts per scan",
+        "Accounts checked per scan (use your full following count for one pass)",
         current.api.max_accounts_per_scan,
-    )
-    posts_per_page = _prompt_int_range(
-        "Posts fetched per account and page",
-        current.api.page_size_tweets,
-        5,
-        100,
-    )
-    max_pages = _prompt_positive_int(
-        "Maximum post pages per account",
-        current.api.max_tweet_pages_per_user,
     )
     max_scan_cost = _prompt_positive_float(
         "Hard maximum estimated scan cost in USD",
         current.api.max_scan_cost_usd,
     )
+    console.print()
+    console.print("UNFOLLOW SAFETY", style="bold bright_cyan")
     max_unfollows = _prompt_positive_int(
-        "Maximum unfollows per run",
+        "Safety cap: maximum accounts actually unfollowed per run",
         current.safety.max_unfollows_per_run,
+    )
+    max_evidence_age = _prompt_positive_int(
+        "Maximum scan evidence age before unfollow (hours)",
+        current.safety.max_evidence_age_hours,
     )
 
     updated = AppConfig(
-        rules=RuleConfig(
-            own_post_threshold_days=own_days,
-            reply_threshold_days=reply_days,
-            combination=combination,
-            count_retweets_as_activity=count_retweets,
-            count_quote_posts_as_own_posts=count_quotes,
-        ),
+        rules=RuleConfig(activity_threshold_days=activity_days),
         safety=SafetyConfig(
             require_review_before_unfollow=True,
             max_unfollows_per_run=max_unfollows,
+            max_evidence_age_hours=max_evidence_age,
         ),
         api=ApiConfig(
             page_size_following=current.api.page_size_following,
-            page_size_tweets=posts_per_page,
-            max_tweet_pages_per_user=max_pages,
             max_accounts_per_scan=max_accounts,
             max_scan_cost_usd=max_scan_cost,
         ),
     )
     write_config(path, updated)
     console.print(f"Config saved: {path}")
+    console.print(
+        f"Scan size: up to {max_accounts} account(s) per pass | "
+        f"Unfollow safety cap: {max_unfollows}",
+        soft_wrap=True,
+    )
 
 
 @app.command()
@@ -797,9 +796,11 @@ def status(
     path = _config_path(resolved_app_dir)
     config = _load_config_or_exit(path)
     records = Storage(resolved_app_dir).load_decisions()
-    cursor = Storage(resolved_app_dir).load_scan_cursor()
+    storage = Storage(resolved_app_dir)
+    cursor = storage.load_scan_cursor()
+    connection_context = storage.load_connection_context()
     candidate_count = sum(1 for record in records if record.decision == "candidate")
-    marked_count = len(_eligible_unfollow_records(records))
+    marked_count = len(_eligible_unfollow_records(records, config.safety))
     token_store = TokenStore(resolved_app_dir)
     try:
         credentials = token_store.load_oauth_credentials()
@@ -818,13 +819,9 @@ def status(
     console.print("x-unfollow status", soft_wrap=True)
     console.print(f"Config path: {path}", soft_wrap=True)
     console.print(f"X connection: {connection_status}", soft_wrap=True)
-    console.print(f"Combination mode: {config.rules.combination.value}", soft_wrap=True)
     console.print(
-        f"Own-post threshold: {config.rules.own_post_threshold_days} days",
-        soft_wrap=True,
-    )
-    console.print(
-        f"Reply threshold: {config.rules.reply_threshold_days} days",
+        "Any-activity threshold: "
+        f"{config.rules.activity_threshold_days} days",
         soft_wrap=True,
     )
     console.print(
@@ -839,13 +836,33 @@ def status(
         f"Maximum unfollows per run: {config.safety.max_unfollows_per_run}",
         soft_wrap=True,
     )
+    console.print(
+        "Maximum scan evidence age: "
+        f"{config.safety.max_evidence_age_hours} hours",
+        soft_wrap=True,
+    )
     console.print(f"Candidate count: {candidate_count}", soft_wrap=True)
     console.print(f"Marked unfollow count: {marked_count}", soft_wrap=True)
+    if connection_context is not None and "following_count" in connection_context:
+        refresh_age = _format_refresh_age(
+            connection_context.get("following_refreshed_at")
+        )
+        console.print(
+            "Current following count: "
+            f"{connection_context['following_count']} ({refresh_age})",
+            soft_wrap=True,
+        )
+    else:
+        console.print(
+            "Current following count: not refreshed yet (press r in the menu)",
+            soft_wrap=True,
+        )
     if cursor is None:
         console.print("Following-list pass: not started", soft_wrap=True)
     elif cursor.complete:
         console.print(
-            f"Following-list pass: complete ({cursor.scanned_count} scanned)",
+            "Last completed scan snapshot: "
+            f"{cursor.scanned_count} accounts (not a live X following count)",
             soft_wrap=True,
         )
     else:
@@ -897,8 +914,56 @@ def check(
     else:
         token_store.save_oauth_credentials(replace(credentials, verified=True))
 
-    Storage(resolved_app_dir).save_connection_context(me.id, me.username)
+    _save_connection_snapshot(Storage(resolved_app_dir), me)
     console.print(f"Connected as @{me.username} ({me.name}).", soft_wrap=True)
+    following_count = _following_count(me)
+    if following_count is not None:
+        console.print(f"Following now: {following_count}", soft_wrap=True)
+
+
+@app.command("refresh-count")
+def refresh_following_count(
+    app_dir: Path | None = typer.Option(
+        None,
+        "--app-dir",
+        help="Directory for config, data, tokens, and exports.",
+    ),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        help="Skip the estimated-cost confirmation.",
+    ),
+) -> None:
+    """Fetch and cache the current number of followed accounts."""
+    resolved_app_dir = _resolve_app_dir(app_dir)
+    console.print("Estimated API read cost: about $0.01.", soft_wrap=True)
+    if not yes and not typer.confirm("Refresh the live following count?", default=False):
+        console.print("Cancelled.")
+        return
+
+    try:
+        token = _load_access_token(resolved_app_dir)
+        with XApiClient(token) as api:
+            me = api.get_me()
+    except MissingTokenError as exc:
+        _print_cli_error(exc)
+        raise typer.Exit(1) from exc
+    except OAuthError as exc:
+        _print_cli_error(exc)
+        raise typer.Exit(1) from exc
+    except XApiError as exc:
+        _print_api_error(exc)
+        raise typer.Exit(1) from exc
+
+    following_count = _following_count(me)
+    if following_count is None:
+        console.print(
+            "X did not return public_metrics.following_count for this account.",
+            soft_wrap=True,
+        )
+        raise typer.Exit(1)
+    _save_connection_snapshot(Storage(resolved_app_dir), me)
+    console.print(f"Following now: {following_count}", soft_wrap=True)
 
 
 @app.command()
@@ -1043,10 +1108,13 @@ def scan(
             _render_tui_header("SCAN IN PROGRESS")
             if stage == "following_loaded":
                 console.print(f"Loaded {total} followed account(s).", soft_wrap=True)
-                console.print("Preparing latest activity lookup...", soft_wrap=True)
-            elif stage == "latest_activity":
                 console.print(
-                    f"Fetching latest activity for {total} account(s)...",
+                    "Preparing local activity timestamp checks...",
+                    soft_wrap=True,
+                )
+            elif stage == "local_activity":
+                console.print(
+                    f"Decoding latest activity locally for {total} account(s)...",
                     soft_wrap=True,
                 )
             elif stage == "account" and user is not None:
@@ -1057,9 +1125,9 @@ def scan(
 
         if stage == "following_loaded":
             console.print(f"Loaded {total} followed account(s).", soft_wrap=True)
-        elif stage == "latest_activity":
+        elif stage == "local_activity":
             console.print(
-                f"Fetching latest activity for {total} account(s)...",
+                f"Decoding latest activity locally for {total} account(s)...",
                 soft_wrap=True,
             )
         elif stage == "account" and user is not None:
@@ -1163,7 +1231,7 @@ def scan(
     )
 
     storage.save_decisions(records)
-    storage.save_connection_context(me.id, me.username)
+    _save_connection_snapshot(storage, me)
     storage.save_scan_context(me.id, me.username)
     candidates_path = storage.export_candidates_csv(records)
     results_path = storage.export_scan_results(records, config)
@@ -1198,6 +1266,7 @@ def review(
 ) -> None:
     """Review pending candidate accounts before unfollowing."""
     resolved_app_dir = _resolve_app_dir(app_dir)
+    config = _load_config_or_exit(_config_path(resolved_app_dir))
     storage = Storage(resolved_app_dir)
     records = storage.load_decisions()
 
@@ -1236,18 +1305,10 @@ def review(
             console.print(f"Name: {record.user.name}", soft_wrap=True)
             console.print(f"Reason: {record.reason}", soft_wrap=True)
             console.print(
-                "Last own post: "
+                "Last X activity: "
                 + _format_activity(
-                    record.last_own_post_at,
-                    record.days_since_own_post,
-                ),
-                soft_wrap=True,
-            )
-            console.print(
-                "Last reply: "
-                + _format_activity(
-                    record.last_reply_at,
-                    record.days_since_reply,
+                    record.last_activity_at,
+                    record.days_since_activity,
                 ),
                 soft_wrap=True,
             )
@@ -1281,7 +1342,7 @@ def review(
                 )
             break
 
-    marked_count = len(_eligible_unfollow_records(records))
+    marked_count = len(_eligible_unfollow_records(records, config.safety))
     if _interactive_tui:
         _render_tui_header("REVIEW COMPLETE")
     console.print(
@@ -1313,7 +1374,7 @@ def unfollow(
     resolved_app_dir = _resolve_app_dir(app_dir)
     config = _load_config_or_exit(_config_path(resolved_app_dir))
     records = Storage(resolved_app_dir).load_decisions()
-    all_eligible_records = _eligible_unfollow_records(records)
+    all_eligible_records = _eligible_unfollow_records(records, config.safety)
     eligible_records = all_eligible_records[: config.safety.max_unfollows_per_run]
 
     if not eligible_records:
@@ -1326,6 +1387,20 @@ def unfollow(
             console.print(
                 f"Blocked {excluded_count} marked account(s) because their "
                 "activity evidence is incomplete. Run a new scan.",
+                soft_wrap=True,
+            )
+        stale_count = sum(
+            1
+            for record in records
+            if record.review == "unfollow"
+            and _has_activity_evidence(record)
+            and not has_fresh_evidence(record, config.safety)
+        )
+        if stale_count:
+            console.print(
+                f"Blocked {stale_count} marked account(s) because their scan "
+                f"evidence is older than {config.safety.max_evidence_age_hours} "
+                "hours. Run a fresh scan.",
                 soft_wrap=True,
             )
         console.print("No reviewed accounts marked for unfollow.")
@@ -1344,7 +1419,7 @@ def unfollow(
         result = execute_unfollows(
             None,
             "dry-run",
-            records,
+            eligible_records,
             config.safety,
             dry_run=True,
         )
@@ -1384,7 +1459,7 @@ def unfollow(
             result = execute_unfollows(
                 api,
                 me.id,
-                records,
+                eligible_records,
                 config.safety,
                 dry_run=False,
             )
@@ -1402,6 +1477,15 @@ def unfollow(
     console.print(f"Attempted: {result.attempted_count}", soft_wrap=True)
     console.print(f"Success: {result.success_count}", soft_wrap=True)
     console.print(f"Failed: {result.failed_count}", soft_wrap=True)
+
+    count_before_unfollow = _following_count(me)
+    if count_before_unfollow is not None:
+        Storage(resolved_app_dir).save_connection_context(
+            me.id,
+            me.username,
+            following_count=max(0, count_before_unfollow - result.success_count),
+            following_refreshed_at=datetime.now(timezone.utc),
+        )
 
     successful_ids = set(getattr(result, "successful_user_ids", ()))
     failures = dict(getattr(result, "failures", ()))

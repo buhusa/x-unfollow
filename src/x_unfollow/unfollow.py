@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Protocol
 
 from x_unfollow.models import DecisionRecord, SafetyConfig
@@ -29,7 +30,7 @@ def execute_unfollows(
     safety: SafetyConfig,
     dry_run: bool,
 ) -> UnfollowResult:
-    targets = _eligible_targets(records)[: max(safety.max_unfollows_per_run, 0)]
+    targets = eligible_targets(records, safety)[: safety.max_unfollows_per_run]
 
     if dry_run:
         return UnfollowResult(
@@ -68,11 +69,35 @@ def execute_unfollows(
     )
 
 
-def _eligible_targets(records: list[DecisionRecord]) -> list[DecisionRecord]:
+def has_activity_evidence(record: DecisionRecord) -> bool:
+    return (
+        record.last_activity_at is not None
+        and record.last_activity_id is not None
+    )
+
+
+def has_fresh_evidence(
+    record: DecisionRecord,
+    safety: SafetyConfig,
+    now: datetime | None = None,
+) -> bool:
+    if not has_activity_evidence(record) or record.scanned_at is None:
+        return False
+    now = now or datetime.now(timezone.utc)
+    age = now - record.scanned_at
+    return timedelta(0) <= age <= timedelta(hours=safety.max_evidence_age_hours)
+
+
+def eligible_targets(
+    records: list[DecisionRecord],
+    safety: SafetyConfig,
+    now: datetime | None = None,
+) -> list[DecisionRecord]:
     return [
         record
         for record in records
         if record.review == "unfollow"
         and record.decision == "candidate"
         and record.account_status == "ok"
+        and has_fresh_evidence(record, safety, now)
     ]

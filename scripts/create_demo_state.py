@@ -5,7 +5,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from x_unfollow.config import write_default_config
-from x_unfollow.models import DecisionRecord, XUser
 from x_unfollow.oauth import DEFAULT_SCOPES, OAuthToken
 from x_unfollow.storage import Storage
 from x_unfollow.tokens import OAuthCredentials, TokenStore
@@ -32,28 +31,13 @@ def main() -> None:
         )
     )
 
-    own_post_at = datetime(2025, 1, 15, 10, 30, tzinfo=timezone.utc)
-    reply_at = datetime(2025, 2, 3, 18, 45, tzinfo=timezone.utc)
-    candidate = DecisionRecord(
-        user=XUser(
-            id="demo-quiet-signal",
-            username="quiet_signal",
-            name="Quiet Signal",
-            most_recent_tweet_id="demo-post-1",
-        ),
-        last_own_post_at=own_post_at,
-        days_since_own_post=560,
-        last_reply_at=reply_at,
-        days_since_reply=541,
-        rule_match_own_post=True,
-        rule_match_reply=True,
-        decision="candidate",
-        reason="no own post >= 180d AND no reply >= 180d",
-    )
-
     storage = Storage(target)
-    storage.save_decisions([candidate])
-    storage.save_scan_context("demo-user", "demo_operator")
+    storage.save_connection_context(
+        "demo-user",
+        "demo_operator",
+        following_count=606,
+        following_refreshed_at=datetime.now(timezone.utc),
+    )
 
 
 if __name__ == "__main__":

@@ -14,29 +14,20 @@ except ModuleNotFoundError:
 from x_unfollow.models import (
     ApiConfig,
     AppConfig,
-    CombinationMode,
     RuleConfig,
     SafetyConfig,
 )
 
 
 ENV_OVERRIDES = {
-    ("rules", "own_post_threshold_days"): "X_UNFOLLOW_OWN_POST_THRESHOLD_DAYS",
-    ("rules", "reply_threshold_days"): "X_UNFOLLOW_REPLY_THRESHOLD_DAYS",
-    ("rules", "combination"): "X_UNFOLLOW_COMBINATION",
-    ("rules", "count_retweets_as_activity"): "X_UNFOLLOW_COUNT_RETWEETS_AS_ACTIVITY",
-    (
-        "rules",
-        "count_quote_posts_as_own_posts",
-    ): "X_UNFOLLOW_COUNT_QUOTE_POSTS_AS_OWN_POSTS",
+    ("rules", "activity_threshold_days"): "X_UNFOLLOW_ACTIVITY_THRESHOLD_DAYS",
     (
         "safety",
         "require_review_before_unfollow",
     ): "X_UNFOLLOW_REQUIRE_REVIEW_BEFORE_UNFOLLOW",
     ("safety", "max_unfollows_per_run"): "X_UNFOLLOW_MAX_UNFOLLOWS_PER_RUN",
+    ("safety", "max_evidence_age_hours"): "X_UNFOLLOW_MAX_EVIDENCE_AGE_HOURS",
     ("api", "page_size_following"): "X_UNFOLLOW_PAGE_SIZE_FOLLOWING",
-    ("api", "page_size_tweets"): "X_UNFOLLOW_PAGE_SIZE_TWEETS",
-    ("api", "max_tweet_pages_per_user"): "X_UNFOLLOW_MAX_TWEET_PAGES_PER_USER",
     ("api", "max_accounts_per_scan"): "X_UNFOLLOW_MAX_ACCOUNTS_PER_SCAN",
     ("api", "max_scan_cost_usd"): "X_UNFOLLOW_MAX_SCAN_COST_USD",
 }
@@ -45,20 +36,15 @@ ENV_OVERRIDES = {
 def default_config_dict() -> dict:
     return {
         "rules": {
-            "own_post_threshold_days": 180,
-            "reply_threshold_days": 180,
-            "combination": "and",
-            "count_retweets_as_activity": False,
-            "count_quote_posts_as_own_posts": True,
+            "activity_threshold_days": 180,
         },
         "safety": {
             "require_review_before_unfollow": True,
             "max_unfollows_per_run": 50,
+            "max_evidence_age_hours": 24,
         },
         "api": {
             "page_size_following": 1000,
-            "page_size_tweets": 5,
-            "max_tweet_pages_per_user": 1,
             "max_accounts_per_scan": 10,
             "max_scan_cost_usd": 0.50,
         },
@@ -112,24 +98,17 @@ def write_default_config(path: Path) -> None:
 def write_config(path: Path, config: AppConfig) -> None:
     data = {
         "rules": {
-            "own_post_threshold_days": config.rules.own_post_threshold_days,
-            "reply_threshold_days": config.rules.reply_threshold_days,
-            "combination": config.rules.combination.value,
-            "count_retweets_as_activity": config.rules.count_retweets_as_activity,
-            "count_quote_posts_as_own_posts": (
-                config.rules.count_quote_posts_as_own_posts
-            ),
+            "activity_threshold_days": config.rules.activity_threshold_days,
         },
         "safety": {
             "require_review_before_unfollow": (
                 config.safety.require_review_before_unfollow
             ),
             "max_unfollows_per_run": config.safety.max_unfollows_per_run,
+            "max_evidence_age_hours": config.safety.max_evidence_age_hours,
         },
         "api": {
             "page_size_following": config.api.page_size_following,
-            "page_size_tweets": config.api.page_size_tweets,
-            "max_tweet_pages_per_user": config.api.max_tweet_pages_per_user,
             "max_accounts_per_scan": config.api.max_accounts_per_scan,
             "max_scan_cost_usd": config.api.max_scan_cost_usd,
         },
@@ -162,16 +141,8 @@ def load_config(path: Path | None = None) -> AppConfig:
 
     return AppConfig(
         rules=RuleConfig(
-            own_post_threshold_days=int(
-                rules_raw.get("own_post_threshold_days", 180)
-            ),
-            reply_threshold_days=int(rules_raw.get("reply_threshold_days", 180)),
-            combination=CombinationMode(rules_raw.get("combination", "and")),
-            count_retweets_as_activity=_parse_bool(
-                rules_raw.get("count_retweets_as_activity", False)
-            ),
-            count_quote_posts_as_own_posts=_parse_bool(
-                rules_raw.get("count_quote_posts_as_own_posts", True)
+            activity_threshold_days=int(
+                rules_raw.get("activity_threshold_days", 180)
             ),
         ),
         safety=SafetyConfig(
@@ -179,13 +150,12 @@ def load_config(path: Path | None = None) -> AppConfig:
                 safety_raw.get("require_review_before_unfollow", True)
             ),
             max_unfollows_per_run=int(safety_raw.get("max_unfollows_per_run", 50)),
+            max_evidence_age_hours=int(
+                safety_raw.get("max_evidence_age_hours", 24)
+            ),
         ),
         api=ApiConfig(
             page_size_following=int(api_raw.get("page_size_following", 1000)),
-            page_size_tweets=int(api_raw.get("page_size_tweets", 5)),
-            max_tweet_pages_per_user=int(
-                api_raw.get("max_tweet_pages_per_user", 1)
-            ),
             max_accounts_per_scan=int(api_raw.get("max_accounts_per_scan", 10)),
             max_scan_cost_usd=float(api_raw.get("max_scan_cost_usd", 0.50)),
         ),

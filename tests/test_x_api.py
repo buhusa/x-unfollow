@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 import httpx
 import pytest
 
-from x_unfollow.models import XPost, XUser
+from x_unfollow.models import XUser
 from x_unfollow.x_api import USER_FIELDS, RateLimitError, XApiClient, XApiError
 
 
@@ -128,6 +128,27 @@ def test_get_following_limits_api_page_size_to_avoid_extra_billable_users():
     assert len(users) == 3
 
 
+def test_user_parser_accepts_current_most_recent_post_id_alias():
+    def handler(request):
+        return json_response(
+            payload={
+                "data": [
+                    {
+                        "id": "1",
+                        "username": "one",
+                        "name": "One",
+                        "most_recent_post_id": "latest-1",
+                    }
+                ],
+                "meta": {},
+            }
+        )
+
+    users = make_client(handler).get_following("123", page_size=1)
+
+    assert users[0].most_recent_tweet_id == "latest-1"
+
+
 def test_get_following_batch_returns_cursor_and_resumes_from_it():
     requests = []
 
@@ -163,79 +184,6 @@ def test_get_following_batch_returns_cursor_and_resumes_from_it():
     assert cursor == "page-2"
     assert [user.username for user in second] == ["three"]
     assert final_cursor is None
-
-
-def test_get_posts_by_ids_batches_fields_and_parses_activity():
-    def handler(request):
-        assert request.method == "GET"
-        assert request.url.path == "/2/tweets"
-        assert request.url.params["ids"] == "p1,p2"
-        assert request.url.params["tweet.fields"] == (
-            "id,created_at,author_id,referenced_tweets,in_reply_to_user_id,text"
-        )
-        return json_response(
-            payload={
-                "data": [
-                    {
-                        "id": "p1",
-                        "author_id": "u1",
-                        "created_at": "2026-06-01T00:00:00Z",
-                        "text": "latest",
-                    }
-                ],
-                "errors": [{"resource_id": "p2", "title": "Not Found"}],
-            }
-        )
-
-    posts = make_client(handler).get_posts_by_ids(["p1", "p2"])
-
-    assert [post.id for post in posts] == ["p1"]
-
-
-def test_get_user_posts_returns_posts_and_next_token_with_aware_created_at():
-    def handler(request):
-        assert request.method == "GET"
-        assert request.url.path == "/2/users/123/tweets"
-        assert request.url.params["max_results"] == "10"
-        assert request.url.params["pagination_token"] == "older"
-        assert request.url.params["exclude"] == "retweets"
-        assert request.url.params["tweet.fields"] == (
-            "id,created_at,author_id,referenced_tweets,in_reply_to_user_id,text"
-        )
-        return json_response(
-            payload={
-                "data": [
-                    {
-                        "id": "p1",
-                        "author_id": "123",
-                        "created_at": "2026-06-08T10:11:12.000Z",
-                        "referenced_tweets": [{"type": "replied_to", "id": "root"}],
-                        "in_reply_to_user_id": "456",
-                        "text": "hello",
-                    }
-                ],
-                "meta": {"next_token": "newer"},
-            }
-        )
-
-    posts, next_token = make_client(handler).get_user_posts(
-        "123",
-        page_size=10,
-        pagination_token="older",
-        exclude_retweets=True,
-    )
-
-    assert posts == [
-        XPost(
-            id="p1",
-            author_id="123",
-            created_at=datetime(2026, 6, 8, 10, 11, 12, tzinfo=timezone.utc),
-            referenced_tweets=[{"type": "replied_to", "id": "root"}],
-            in_reply_to_user_id="456",
-            text="hello",
-        )
-    ]
-    assert next_token == "newer"
 
 
 def test_unfollow_returns_true_only_when_api_reports_not_following():

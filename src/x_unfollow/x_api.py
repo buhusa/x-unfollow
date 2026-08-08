@@ -6,11 +6,10 @@ from typing import Any
 import httpx
 
 from x_unfollow import __version__
-from x_unfollow.models import XPost, XUser
+from x_unfollow.models import XUser
 
 
 USER_FIELDS = "id,username,name,protected,verified,public_metrics,most_recent_tweet_id"
-TWEET_FIELDS = "id,created_at,author_id,referenced_tweets,in_reply_to_user_id,text"
 
 
 class XApiError(RuntimeError):
@@ -111,43 +110,6 @@ class XApiClient:
             if not next_token:
                 return users, None
 
-    def get_user_posts(
-        self,
-        user_id: str,
-        page_size: int,
-        pagination_token: str | None = None,
-        exclude_retweets: bool = False,
-    ) -> tuple[list[XPost], str | None]:
-        params = {
-            "max_results": page_size,
-            "tweet.fields": TWEET_FIELDS,
-        }
-        if pagination_token:
-            params["pagination_token"] = pagination_token
-        if exclude_retweets:
-            params["exclude"] = "retweets"
-
-        response = self._request("GET", f"/users/{user_id}/tweets", params=params)
-        payload = response.json()
-        posts = [_parse_post(item) for item in payload.get("data", [])]
-        next_token = payload.get("meta", {}).get("next_token")
-        return posts, next_token
-
-    def get_posts_by_ids(self, post_ids: list[str]) -> list[XPost]:
-        if not post_ids:
-            return []
-        if len(post_ids) > 100:
-            raise ValueError("X allows at most 100 post IDs per lookup request")
-        response = self._request(
-            "GET",
-            "/tweets",
-            params={
-                "ids": ",".join(post_ids),
-                "tweet.fields": TWEET_FIELDS,
-            },
-        )
-        return [_parse_post(item) for item in response.json().get("data", [])]
-
     def unfollow(self, source_user_id: str, target_user_id: str) -> bool:
         response = self._request(
             "DELETE",
@@ -168,39 +130,18 @@ class XApiClient:
 
 
 def _parse_user(data: dict[str, Any]) -> XUser:
+    most_recent_post_id = data.get("most_recent_tweet_id") or data.get(
+        "most_recent_post_id"
+    )
     return XUser(
         id=str(data["id"]),
         username=data["username"],
         name=data["name"],
-        most_recent_tweet_id=(
-            str(data["most_recent_tweet_id"])
-            if data.get("most_recent_tweet_id")
-            else None
-        ),
+        most_recent_tweet_id=(str(most_recent_post_id) if most_recent_post_id else None),
         protected=bool(data.get("protected", False)),
         verified=bool(data.get("verified", False)),
         public_metrics=dict(data.get("public_metrics", {})),
     )
-
-
-def _parse_post(data: dict[str, Any]) -> XPost:
-    return XPost(
-        id=str(data["id"]),
-        author_id=str(data["author_id"]),
-        created_at=_parse_x_datetime(data["created_at"]),
-        referenced_tweets=list(data.get("referenced_tweets", [])),
-        in_reply_to_user_id=data.get("in_reply_to_user_id"),
-        text=data.get("text", ""),
-    )
-
-
-def _parse_x_datetime(value: str) -> datetime:
-    if value.endswith("Z"):
-        value = f"{value[:-1]}+00:00"
-    parsed = datetime.fromisoformat(value)
-    if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
 
 
 def _error_from_response(response: httpx.Response) -> XApiError:

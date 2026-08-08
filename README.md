@@ -1,37 +1,36 @@
 # X-Unfollow
 
-A review-first terminal app for finding and unfollowing inactive X accounts
-with the official X API.
+A low-cost, review-first terminal app for finding and unfollowing inactive X
+accounts through the official X API.
 
 ![X-Unfollow terminal demo](docs/assets/demo.gif)
 
-## What it does
+_The walkthrough uses local sample accounts. It makes no X API requests and
+changes no real account._
 
-X-Unfollow:
+## Why X-Unfollow
 
-- loads accounts you follow;
-- continues with the next batch on every run instead of starting over;
-- checks their latest own posts and replies;
-- applies inactivity rules you control;
-- lets you review every candidate;
-- previews changes before anything happens;
-- unfollows only accounts you explicitly marked and confirmed; and
-- exports a complete, manually auditable record of every checked account.
+- One simple activity scan with no paid Post reads
+- Adjustable inactivity threshold, batch size, budget, and safety limits
+- Keyboard-controlled terminal interface
+- Review and dry-run preview before any unfollow
+- Resumable batches instead of scanning the same accounts again
+- CSV exports for manual verification
+- No scraping, browser automation, or LLM decisions
 
-It uses deterministic Python code. There is no scraping, browser automation, or
-LLM deciding who to unfollow.
+Any X activity counts: original posts, replies, reposts, and quotes. X-Unfollow
+reads each Following resource's latest Post ID and decodes its timestamp
+locally. Missing or invalid evidence is always kept, never marked inactive.
 
 ## Requirements
 
 - macOS or Linux
-- Python 3.11 or newer
-- an X Developer account and App
-- X API credits
+- Python 3.11+
+- An X Developer App with API credits
 
-X Premium does not include X API usage. Credits at `console.x.ai` are also not
-X API credits.
+X Premium and `console.x.ai` credits do not include X API access.
 
-## 1. Download and start
+## Quick start
 
 ```bash
 git clone https://github.com/buhusa/x-unfollow.git
@@ -40,53 +39,45 @@ cd x-unfollow
 ```
 
 The launcher creates a local Python environment, installs the app, and opens
-the keyboard-controlled menu.
+the menu.
 
-## 2. Create the X Developer App
+## X Developer setup
 
-1. Open the [X Developer Console](https://console.x.com/) and sign in.
-2. Create an App or open an existing one.
-3. Enable **OAuth 2.0** user authentication.
-4. Choose **Native App** as the App type.
-5. Enable **Read and write** permissions.
-6. Add this callback URL exactly:
+1. Open the [X Developer Console](https://console.x.com/) and create an App.
+2. Enable **OAuth 2.0** user authentication.
+3. Select **Native App** and **Read and write** permissions.
+4. Add this callback URL exactly:
 
    ```text
    http://127.0.0.1:8765/callback
    ```
 
-7. Save the settings.
-8. Open **Keys and tokens** and copy the OAuth 2.0 **Client ID**.
+5. Copy the OAuth 2.0 **Client ID** from **Keys and tokens**.
+6. Start X-Unfollow and paste the Client ID when prompted.
 
-On the first `./start.sh` launch, paste that Client ID into X-Unfollow. Your
-browser opens so you can authorize the App.
+The browser handles authorization. Do not paste a Client Secret, access token,
+or refresh token into the app.
 
-You do **not** paste a Client Secret, access token, or refresh token. X-Unfollow
-receives and stores the user tokens automatically after browser authorization.
+## Add API credits
 
-Official references:
-[X Developer Apps](https://docs.x.com/fundamentals/developer-apps) and
-[OAuth 2.0 with PKCE](https://docs.x.com/fundamentals/authentication/oauth-2-0/user-access-token).
+In [console.x.com](https://console.x.com/), open your Developer account's
+billing area, add a payment method, and purchase X API credits. The app shows
+an estimate before every paid scan and blocks scans above your local budget.
 
-## 3. Add X API credits
+At the currently documented rates, scanning 1,000 accounts costs about `$1`:
 
-The X API is pay per use:
+```text
+Authenticated User read       $0.010
+1,000 owned Following reads   $1.000
+Post reads                     $0.000
+------------------------------------
+Estimated total               $1.010
+```
 
-1. Open [console.x.com](https://console.x.com/).
-2. Select your Developer account.
-3. Open its billing or credits area.
-4. Add a payment method if requested.
-5. Purchase X API credits.
-6. Optionally configure auto-recharge and a spending limit.
+Pricing can change. Check the official [X API pricing page](https://docs.x.com/x-api/getting-started/pricing)
+and Developer Console before larger runs.
 
-The Developer Console shows the current balance and endpoint prices. X-Unfollow
-shows a worst-case estimate before every paid scan and blocks scans above your
-configured budget.
-
-See the official [X API pricing page](https://docs.x.com/x-api/getting-started/pricing)
-for current rates.
-
-## 4. Use the workflow
+## Workflow
 
 ```text
 1  Scan followed accounts
@@ -95,135 +86,51 @@ for current rates.
 4  Execute marked unfollows
 ```
 
-Use Up/Down or `j`/`k` to move, Enter to select, `1-9` for direct access, and
-`q` to quit.
+Use Up/Down or `j`/`k` to navigate, Enter to select, and `q` to quit. Press `r`
+to refresh the current following count. Opening the app and navigating the menu
+use only cached local data and make no API calls.
 
-During review:
+During review, `u` marks an account for unfollow, `k` keeps it, `s` skips it,
+and `o` shows its X profile. Marking is local; option `4` still requires a
+separate confirmation.
 
-```text
-u  mark for unfollow
-k  keep
-s  skip
-o  show profile URL
-q  leave review
-```
+## Batches and exports
 
-Pressing `u` only creates a local mark. The real unfollow happens later in step
-4 and always requires a separate confirmation.
+Each run continues from X's saved pagination cursor. For example, batches of
+100 process accounts 1-100, then 101-200, until the pass is complete.
 
-### Scan batches
+Option `8` lists:
 
-If your limit is 100 accounts, the first run scans accounts 1-100 and stores
-X's pagination cursor locally. The next run continues with the next batch. It
-does not intentionally rescan the first 100.
+- `scan_results.csv` - every account in the current pass
+- `scan_history.csv` - append-only results from all completed batches
+- `candidates.csv` - accounts matching the inactivity rule
 
-When the complete following list has been reached, X-Unfollow stops. Start a
-fresh pass from account 1 only when you confirm it in the menu or run:
+## Privacy and safety
 
-```bash
-.venv/bin/x-unfollow scan --restart
-```
+Private state remains in the Git-ignored `user-data/` folder, including OAuth
+tokens, scan results, exports, and the unfollow audit. Never publish this
+folder.
 
-Changing activity rules during an unfinished pass blocks resume so results
-from different rules are not mixed. Start a new pass to use the changed rules.
+Real unfollows require fresh, complete scan evidence and explicit review. A
+configurable per-run cap prevents unexpectedly large operations.
 
-Avoid following or unfollowing accounts while a multi-batch pass is running.
-X controls the ordering of its live following list, so changes during a pass
-can shift accounts between pages.
-
-X pagination tokens are opaque and can expire. If X rejects a saved token,
-your existing results stay untouched and the CLI tells you to start a fresh
-pass. See the official [X pagination guide](https://docs.x.com/x-api/fundamentals/pagination).
-
-## Verify scan results
-
-Menu option `8` shows three CSV files:
-
-- `scan_results.csv`: every account in the current pass;
-- `scan_history.csv`: every completed batch from all passes; and
-- `candidates.csv`: only accounts matching your inactivity rules.
-
-The full result includes the scan time, batch and position, decision, evidence
-status, rule matches, last own-post and reply dates, and direct X URLs for the
-posts when X returned their IDs. No OAuth tokens or post text are exported.
-
-Open `scan_results.csv` in a spreadsheet when you want to manually compare the
-tool's decision with the linked X profiles and posts.
-
-Results created with X-Unfollow `0.1.x` do not contain a saved X cursor. The
-first scan after upgrading to `0.2.x` starts a new pass; later runs continue
-normally from the stored cursor.
-
-## Settings and costs
-
-Menu option `5` controls:
-
-- own-post inactivity threshold;
-- reply inactivity threshold;
-- `and` or `or` rule matching;
-- accounts and posts fetched per scan;
-- hard maximum scan cost; and
-- maximum unfollows per run.
-
-The default rule requires no own post and no reply for 180 days.
-
-X can change its pricing. Treat the estimate as a guardrail and the Developer
-Console as the source of truth.
-
-## Local data and privacy
-
-When launched with `./start.sh`, private state stays in:
-
-```text
-x-unfollow/user-data/
-```
-
-This includes OAuth tokens, scan results, exports, and the unfollow audit log.
-The entire directory is ignored by Git. Never upload it or paste its contents
-into a public issue.
-
-Successful unfollows are recorded locally in:
-
-```text
-user-data/data/unfollow_audit.jsonl
-```
-
-## Useful direct commands
+## Direct commands
 
 ```bash
 .venv/bin/x-unfollow status
 .venv/bin/x-unfollow check
-.venv/bin/x-unfollow scan --limit 3
+.venv/bin/x-unfollow refresh-count
+.venv/bin/x-unfollow scan --limit 100
+.venv/bin/x-unfollow scan --restart
 .venv/bin/x-unfollow review
 .venv/bin/x-unfollow unfollow --dry-run
 ```
 
-The interactive menu is recommended for normal use.
-
-## Troubleshooting
-
-**Callback URL error**
-
-Use `http://127.0.0.1:8765/callback` exactly. Do not use `localhost` or add a
-trailing slash.
-
-**Payment or access error**
-
-Check the X API balance and App status at `console.x.com`. Adding funds at
-`console.x.ai` does not fund X API requests.
-
-**Wrong X account**
-
-Choose menu option `6` and authorize again while signed in to the intended X
-account.
-
-More details are available in [docs/HOW_TO.md](docs/HOW_TO.md).
+For troubleshooting and detailed behavior, see [docs/HOW_TO.md](docs/HOW_TO.md).
 
 ## About
 
-Created by [@buhusa](https://x.com/buhusa).
-
-Website: [buhussy.xyz](https://buhussy.xyz/)
+Created by [@buhusa](https://x.com/buhusa) | [buhussy.xyz](https://buhussy.xyz/)
 
 ## License
 

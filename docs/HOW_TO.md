@@ -83,7 +83,7 @@ created with owner-only permissions on supported systems.
 
 ## Recommended first run
 
-1. Open option `5` and review the inactivity rules and budget.
+1. Open option `5` and review the inactivity thresholds and budget.
 2. Use option `1` to run a small scan.
    Repeating option `1` continues with the next batch until the full list is done.
 3. Use option `2` to review candidates.
@@ -102,8 +102,33 @@ The scan is blocked when that estimate exceeds the configured hard budget,
 even when a command uses `--yes`. You can adjust the budget and maximum account
 count in option `5`.
 
+Option `5` also controls the maximum evidence age for real unfollows. The
+default is 24 hours. Older marked results remain local but cannot be executed
+until a fresh scan confirms them again.
+
 Actual charges can be lower due to fewer returned resources and X API
 deduplication. Pricing can change, so check the Developer Console.
+
+### Activity Scan
+
+The scan counts every Post type as activity: original posts, replies, reposts,
+and quotes. It reads `most_recent_tweet_id` from each Following resource and
+decodes the Snowflake timestamp locally. The app has no Post-lookup or account-
+timeline scan path.
+
+At current documented prices, 1,000 accounts are estimated at about `$1.01`:
+
+```text
+Authenticated user read             $0.010
+1,000 owned Following reads         $1.000
+Post reads                           $0.000
+-------------------------------------------
+Estimated total                     $1.010
+```
+
+An account with recent reposts still counts as active. If X provides no valid
+latest-activity ID, the result is marked incomplete and kept. The tool does not
+guess that missing data means inactivity.
 
 ## Continue or restart a scan
 
@@ -129,6 +154,14 @@ Older `0.1.x` scan files have no reusable X pagination cursor. The first scan
 after upgrading starts a new pass from the beginning. Every later batch can be
 resumed normally.
 
+## Refresh the current following count
+
+Press `r` in the main menu to fetch the account's current `following_count`.
+The menu caches the value with its refresh age, so navigating around the app
+does not make additional API calls. The count is also refreshed during the
+connection test and at the start of a paid scan. One manual refresh currently
+costs about `$0.01` before X billing deduplication.
+
 ## Check the tool's work
 
 After each successful batch, option `8` lists:
@@ -140,9 +173,9 @@ candidates.csv    only current inactivity candidates
 ```
 
 `scan_results.csv` is the easiest file for manual verification. It includes
-the exact rules used, scan time, account status, decision, latest own-post and
-reply timestamps, plus direct post URLs when available. The export deliberately
-does not contain OAuth credentials or post text.
+the inactivity threshold, scan time, account status, decision, latest activity
+timestamp and age, plus a direct evidence URL. The export deliberately does not
+contain OAuth credentials or post text.
 
 ## Files
 
@@ -199,11 +232,10 @@ Credits shown at `console.x.ai` are separate.
 Reduce the number of accounts or increase the hard scan budget in option `5`.
 The CLI intentionally refuses to bypass this limit.
 
-### No exact reply or own-post date
+### A reposting account is considered active
 
-The newest activity can be enough to make a safe decision, but it does not
-always reveal the exact date for both activity types. Increase timeline depth
-in option `5` if that extra detail is worth the additional API cost.
+This is intentional. The app checks whether an account has shown any X activity
+without buying individual Post reads. It does not distinguish activity types.
 
 ## Direct commands
 
@@ -211,6 +243,7 @@ in option `5` if that extra detail is worth the additional API cost.
 .venv/bin/x-unfollow --help
 .venv/bin/x-unfollow status
 .venv/bin/x-unfollow check
+.venv/bin/x-unfollow refresh-count
 .venv/bin/x-unfollow scan --limit 3
 .venv/bin/x-unfollow scan --restart
 .venv/bin/x-unfollow review
